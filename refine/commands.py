@@ -36,7 +36,18 @@ from typing import List, Optional
 
 import httpx
 
+from .api_health import DEAD_MODEL_MARKERS, error_detail, health
+
 API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+#: Groq retired `llama-3.3-70b-versatile` on 2026-08-16, naming
+#: openai/gpt-oss-120b and qwen/qwen3.6-27b as the replacements
+#: (https://console.groq.com/docs/deprecations, fetched 2026-09-13). The
+#: retired id is kept last in the chain for accounts that still resolve it.
+DEFAULT_MODEL = os.getenv("GROQ_COMMAND_MODEL", "openai/gpt-oss-120b")
+FALLBACK_MODELS = ["openai/gpt-oss-120b", "qwen/qwen3.6-27b",
+                   "openai/gpt-oss-20b", "llama-3.3-70b-versatile"]
+HEALTH_SOURCE = "commands"
 
 SYSTEM_PROMPT = """You transform text. The user selected some text and spoke an instruction.
 
@@ -111,16 +122,23 @@ class CommandProcessor:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "llama-3.3-70b-versatile",
+        model: Optional[str] = None,
+        models: Optional[List[str]] = None,
         timeout: float = 20.0,
     ):
         # A heavier model than dictation cleanup: transformations are
         # reasoning tasks, they run once per invocation rather than on
         # every utterance, and the user is already waiting.
         self.api_key = (api_key or os.getenv("GROQ_API_KEY", "")).strip()
-        self.model = model
+        self.model = (model or DEFAULT_MODEL).strip()
+        chain = list(models or [])
+        for m in (self.model, *FALLBACK_MODELS):
+            if m and m not in chain:
+                chain.append(m)
+        self.models = chain
         self.timeout = timeout
         self._client: Optional[httpx.AsyncClient] = None
+        self.last_model_used: Optional[str] = None
 
         self.invocations = 0
         self.rejections = 0
@@ -176,10 +194,10 @@ class CommandProcessor:
             )
 
         self.invocations += 1
+        health.note_call(HEALTH_SOURCE)
         try:
             client = await self._get_client()
-            resp = await client.post(API_URL, json={
-                "model": self.model,
+            payload = {
                 "messages": [
                     {"role": "system", "content": self._system(dictionary_terms, app_context)},
                     # Separate turns: the selection must read as data, not
@@ -189,35 +207,71 @@ class CommandProcessor:
                 ],
                 "temperature": 0.2,
                 "max_tokens": min(max(len(selected_text) // 2, 512), 4096),
-            })
+            }
 
-            if resp.status_code != 200:
+            for model in health.ordered(HEALTH_SOURCE, self.models):
+                payload["model"] = model
+                resp = await client.post(API_URL, json=payload, timeout=self.timeout)
+
+                if resp.status_code != 200:
+                    detail = error_detail(resp)
+                    if any(k in detail.lower() for k in DEAD_MODEL_MARKERS):
+                        health.mark_dead(HEALTH_SOURCE, model)
+                        continue
+                    health.note_failure(HEALTH_SOURCE, f"HTTP {resp.status_code}: {detail}", http=True)
+                    return CommandResult(
+                        ok=False,
+                        error=f"Groq HTTP {resp.status_code}: {detail}",
+                        instruction=instruction,
+                    )
+
+                data = resp.json()
+                choice = (data.get("choices") or [{}])[0]
+                if choice.get("finish_reason") == "length":
+                    # A truncated transformation would be injected as if it
+                    # were the whole result, silently dropping the end of the
+                    # user's selection.
+                    health.note_failure(HEALTH_SOURCE, "completion truncated (finish_reason=length)")
+                    return CommandResult(
+                        ok=False,
+                        error="Groq stopped early (max_tokens); the result would be truncated.",
+                        instruction=instruction,
+                    )
+                raw = (choice.get("message") or {}).get("content") or ""
+                if isinstance(raw, list):  # reasoning/content part lists
+                    raw = "".join(str(part.get("text", "")) if isinstance(part, dict) else str(part)
+                                  for part in raw)
+                text = clean_output(raw)
+
+                problem = validate(selected_text, text, instruction)
+                if problem:
+                    self.rejections += 1
+                    self.last_rejected = problem
+                    health.note_failure(HEALTH_SOURCE, f"output rejected: {problem}")
+                    return CommandResult(ok=False, error=problem, instruction=instruction)
+
+                self.last_rejected = None
+                self.last_model_used = model
+                health.note_success(HEALTH_SOURCE)
                 return CommandResult(
-                    ok=False,
-                    error=f"Groq HTTP {resp.status_code}",
+                    text=text,
+                    ok=True,
                     instruction=instruction,
+                    latency_ms=int((time.perf_counter() - started) * 1000),
                 )
 
-            raw = resp.json()["choices"][0]["message"]["content"]
-            text = clean_output(raw)
-
-            problem = validate(selected_text, text, instruction)
-            if problem:
-                self.rejections += 1
-                self.last_rejected = problem
-                return CommandResult(ok=False, error=problem, instruction=instruction)
-
-            self.last_rejected = None
             return CommandResult(
-                text=text,
-                ok=True,
+                ok=False,
+                error="No Groq model id in the candidate list was usable: "
+                      + ", ".join(self.models),
                 instruction=instruction,
-                latency_ms=int((time.perf_counter() - started) * 1000),
             )
 
         except httpx.TimeoutException:
+            health.note_failure(HEALTH_SOURCE, "timed out", timeout=True)
             return CommandResult(ok=False, error="Timed out.", instruction=instruction)
         except Exception as e:
+            health.note_failure(HEALTH_SOURCE, f"{type(e).__name__}: {e}")
             return CommandResult(
                 ok=False, error=f"{type(e).__name__}: {e}", instruction=instruction
             )
@@ -246,6 +300,8 @@ class CommandProcessor:
     def get_stats(self) -> dict:
         return {
             "model": self.model,
+            "models": list(self.models),
+            "model_used": self.last_model_used,
             "configured": self.is_configured,
             "invocations": self.invocations,
             "rejections": self.rejections,

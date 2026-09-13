@@ -341,7 +341,50 @@ class TestStreaming:
         s = StreamingSession(api_key="k")
         s.feed(np.zeros(160, dtype=np.float32))  # must not raise
 
-    def test_partial_assembly_across_turns(self):
+    def test_partial_supersedes_then_final_appends(self):
+        """Vendor: "Within a turn, each Turn message supersedes the previous
+        one. Render the latest transcript; do not append."" ("""
+        s = StreamingSession(api_key="k", format_turns=True)
+        s._handle_turn({"turn_order": 0, "transcript": "hello",
+                        "end_of_turn": False, "turn_is_formatted": False})
+        s._handle_turn({"turn_order": 0, "transcript": "hello there",
+                        "end_of_turn": False, "turn_is_formatted": False})
+        assert s._live_text() == "hello there"
+        s._handle_turn({"turn_order": 1, "transcript": "and more",
+                        "end_of_turn": False, "turn_is_formatted": False})
+        assert s._live_text() == "hello there and more"
+
+    def test_final_turn_is_the_text_of_the_result(self):
+        s = StreamingSession(api_key="k", format_turns=True)
+        s._handle_turn({"turn_order": 0, "transcript": "hello there",
+                        "end_of_turn": True, "turn_is_formatted": True,
+                        "words": [{"text": "hello", "confidence": 0.99},
+                                  {"text": "there", "confidence": 0.98}]})
+        r = s._result()
+        assert r.text == "hello there"
+        assert len(r.words) == 2, "words must be taken once per final turn"
+
+    def test_unformatted_final_is_not_double_counted(self):
+        """With format_turns on, each turn arrives twice: raw then formatted."""
+        s = StreamingSession(api_key="k", format_turns=True)
+        s._handle_turn({"turn_order": 0, "transcript": "hello there",
+                        "end_of_turn": True, "turn_is_formatted": False})
+        # Not a final -- but not thrown away either: if the socket died here
+        # the user keeps their words and loses the formatting.
+        assert not s._turns[0].final
+        assert s._result().text == "hello there"
+        s._handle_turn({"turn_order": 0, "transcript": "Hello there.",
+                        "end_of_turn": True, "turn_is_formatted": True})
+        assert s._result().text == "Hello there."
+
+    def test_repeated_formatted_finals_do_not_duplicate(self):
+        s = StreamingSession(api_key="k", format_turns=True)
+        for _ in range(3):
+            s._handle_turn({"turn_order": 0, "transcript": "One time.",
+                            "end_of_turn": True, "turn_is_formatted": True})
+        assert s._result().text == "One time."
+
+    def test_turns_without_turn_order_still_work(self):
         seen = []
         s = StreamingSession(api_key="k", on_partial=seen.append)
         s._handle_turn({"transcript": "hello", "end_of_turn": False})
@@ -349,20 +392,12 @@ class TestStreaming:
                         "turn_is_formatted": True})
         s._handle_turn({"transcript": "again", "end_of_turn": False})
         assert seen[-1] == "hello there again"
-
-    def test_unformatted_final_is_not_double_counted(self):
-        """With format_turns on, each turn arrives twice: raw then formatted."""
-        s = StreamingSession(api_key="k", format_turns=True)
-        s._handle_turn({"transcript": "hello there", "end_of_turn": True,
-                        "turn_is_formatted": False})
-        s._handle_turn({"transcript": "Hello there.", "end_of_turn": True,
-                        "turn_is_formatted": True})
-        assert s._result().text == "Hello there."
+        assert s._result().text == "hello there"
 
     def test_result_collects_word_confidences(self):
         s = StreamingSession(api_key="k")
-        s._handle_turn({"transcript": "deploy now", "end_of_turn": True,
-                        "turn_is_formatted": True,
+        s._handle_turn({"turn_order": 0, "transcript": "deploy now",
+                        "end_of_turn": True, "turn_is_formatted": True,
                         "words": [{"text": "deploy", "confidence": 0.4},
                                   {"text": "now", "confidence": 0.99}]})
         r = s._result()
@@ -376,6 +411,132 @@ class TestStreaming:
     def test_empty_stream_without_error_is_ok(self):
         """Genuine silence over a healthy socket is not an error."""
         assert StreamingSession(api_key="k")._result().ok
+
+    # ── model pinning (audit C10) ─────────────────────────────────────────
+
+    def test_connection_params_name_the_model(self):
+        """Unrecognised params are ignored silently by the server, and an
+        omitted speech_model means "whatever the account defaults to" -- so it
+        has to be on the URL, matching the batch model we fall back to."""
+        s = StreamingSession(api_key="k", batch_model="universal-3-5-pro")
+        params = s.connection_params()
+        assert params["speech_model"] == "universal-3-5-pro"
+        assert params["sample_rate"] == 16000
+        assert params["encoding"] == "pcm_s16le"
+        assert params["format_turns"] == "true"
+
+    def test_batch_only_models_map_to_a_realtime_id(self):
+        from stt.streaming import STREAMING_MODELS, streaming_model_for
+
+        for batch in ("universal-3-5-pro", "universal-3-pro", "slam-1",
+                      "universal-2", "", "gibberish-typo"):
+            assert streaming_model_for(batch) in STREAMING_MODELS, batch
+
+    def test_begin_echo_mismatch_degrades_the_session(self):
+        """"Always check that configuration.model matches the speech_model you
+        requested" -- a mismatch must not be shown to the user as if it were
+        the pinned model."""
+        s = StreamingSession(api_key="k", speech_model="universal-3-5-pro")
+        s._handle_begin({"id": "sess-1",
+                         "configuration": {"model": "universal-streaming-english"}})
+        assert s.degraded and s.session_id == "sess-1"
+        assert "universal-streaming-english" in (s.error or "")
+
+    def test_begin_records_session_id_when_it_matches(self):
+        s = StreamingSession(api_key="k", speech_model="universal-3-5-pro")
+        s._handle_begin({"id": "abc", "configuration": {"model": "universal-3-5-pro"}})
+        assert not s.degraded and s.session_id == "abc"
+
+    def test_termination_audio_duration_is_authoritative(self):
+        """The server's count of processed audio beats our sent-byte estimate
+        and is what support asks about."""
+        s = StreamingSession(api_key="k")
+        s._started = 0.0
+        s._samples_sent = 16000 * 3
+        # Termination is normally applied by the receive loop; exercise it.
+        s.server_duration_s = 2.4
+        s._handle_turn({"turn_order": 0, "transcript": "hi",
+                        "end_of_turn": True, "turn_is_formatted": True})
+        assert abs(s._result().audio_duration_s - 2.4) < 1e-9
+
+    def test_keyterms_capped_for_streaming(self):
+        s = StreamingSession(api_key="k",
+                             keyterms=["x" * 60] + [f"term{i}" for i in range(200)])
+        import json as _json
+        sent = _json.loads(s.connection_params()["keyterms_prompt"])
+        assert len(sent) == 100 and all(len(t) <= 50 for t in sent)
+
+    def test_terminate_then_drain_order(self):
+        """Termination must be *sent* and the socket read before it closes --
+        closing on Terminate discards the last transcript (audit C11)."""
+        import asyncio as _a
+
+        sent = []
+
+        class FakeWS:
+            def __init__(self):
+                self.closed = False
+
+            async def send(self, payload):
+                sent.append(payload)
+
+            async def close(self):
+                self.closed = True
+
+        async def run():
+            s = StreamingSession(api_key="k")
+            s.ok = True
+            ws = FakeWS()
+            s._ws = ws
+            s._recv_task = _a.create_task(_a.sleep(0))
+            s._send_task = _a.create_task(_a.sleep(0))
+            s.ok = True                      # a healthy socket being stopped
+            await s.close_and_finalise(timeout=0.3)
+            return s, ws
+
+        s, ws = _a.run(run())
+        texts = [t for t in sent if t.startswith("{")]
+        assert any("ForceEndpoint" in t for t in texts), sent
+        assert any("Terminate" in t for t in texts), sent
+        assert ws.closed
+        assert texts.index('{"type": "Terminate"}') < len(texts)
+
+    def test_abort_still_terminates(self):
+        sent = []
+
+        class FakeWS:
+            async def send(self, payload):
+                sent.append(payload)
+
+            async def close(self):
+                pass
+
+        async def run():
+            s = StreamingSession(api_key="k")
+            s.ok = True
+            s._ws = FakeWS()
+            await s.abort()
+            return s
+
+        s = asyncio.run(run())
+        assert any("Terminate" in t for t in sent), sent
+        assert s.degraded and not s.ok
+
+    def test_send_frames_are_50ms(self):
+        from stt.streaming import CHUNK_MS, CHUNK_SAMPLES, SAMPLE_RATE
+
+        assert CHUNK_MS == 50
+        assert CHUNK_SAMPLES == SAMPLE_RATE * CHUNK_MS // 1000 == 800
+
+    def test_control_frame_never_raises_on_dead_socket(self):
+        s = StreamingSession(api_key="k")
+
+        class Boom:
+            async def send(self, _p):
+                raise RuntimeError("socket closed")
+
+        s._ws = Boom()
+        assert asyncio.run(s._send_control({"type": "Terminate"})) is False
 
 
 if __name__ == "__main__":

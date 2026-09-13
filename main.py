@@ -14,6 +14,7 @@ import threading
 import time
 import traceback
 import winsound
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -31,6 +32,7 @@ from audio import AudioCapture, process as process_audio
 from context import AppContextReader, DictionaryLearner, ProfileSet, SnippetSet
 from injector import TextInjector
 from refine import Refiner, basic_cleanup
+from refine.api_health import health
 from refine.commands import CommandProcessor
 from selection import SelectionManager
 from stt import (
@@ -146,6 +148,13 @@ class WhisprFlowApp:
         self.last_failed = False
         self._start_time = 0.0
         self._partial = ""
+
+        # Rolling end-to-end latency so the Settings page can say what this
+        # machine's round trip actually is instead of claiming "latency low"
+        # (audit C3: the status text was hardcoded, which is exactly the kind
+        # of reassurance that goes stale without anyone noticing).
+        self._latency_ms = deque(maxlen=8)
+        self.api_health = health
 
         # Hands-free mode. A quick tap of the hotkey locks recording on;
         # holding it is classic push-to-talk. Both gestures use the same
@@ -607,8 +616,13 @@ class WhisprFlowApp:
                 name_str = curr.name if curr else "Default Microphone"
                 self.mic_status_label.config(
                     text=f"{name_str}{def_tag}", fg=theme.HEX_SUCCESS)
+                if self._latency_ms:
+                    avg = int(sum(self._latency_ms) / len(self._latency_ms))
+                    lat = f"last {self._latency_ms[-1]} ms · avg {avg} ms"
+                else:
+                    lat = "no dictation yet this session"
                 self.mic_sub.config(
-                    text="16 kHz mono · ready · latency low")
+                    text=f"16 kHz mono · ready · {lat}")
 
         if not self.refinement_enabled.get():
             txt, col = "Off — raw transcript", theme.HEX_MUTED
@@ -616,12 +630,21 @@ class WhisprFlowApp:
             txt, col = "No Groq key — basic cleanup only", theme.HEX_WARNING
         else:
             st = self.refiner.get_stats()
-            if st["rejections"]:
-                txt = f"{st['model']} · guard blocked {st['rejections']}/{st['calls']}"
+            # Surfacing the failure is the whole point of the change: before
+            # this, a retired model id or a dead key looked identical to a
+            # working refiner, because every failure path returned cleaned
+            # text (audit C1/C3).
+            used = st.get("model_used") or st["model"]
+            if st["last_api_error"]:
+                txt = f"{used} · NOT refining: {st['last_api_error']}"
+                col = theme.HEX_DANGER
+            elif st["rejections"]:
+                txt = (f"{used} · guard blocked {st['rejections']}/{st['calls']}"
+                       " (raw text kept)")
                 col = theme.HEX_WARNING
             else:
-                txt, col = f"{st['model']} · guarded", theme.HEX_SUCCESS
-            self.refine_status.config(text=txt, fg=col)
+                txt, col = f"{used} · guarded", theme.HEX_SUCCESS
+            self.refine_status.config(text=txt, fg=col, wraplength=280)
         self.dict_label.config(text=f"{len(self.dictionary)} terms")
         self.snippet_label.config(text=f"{len(self.snippets)} triggers")
 
@@ -630,8 +653,9 @@ class WhisprFlowApp:
             self.command_status.config(text="Needs a Groq key", fg=theme.HEX_WARNING)
         elif cs["invocations"]:
             self.command_status.config(
-                text=f"{cs['invocations']} used \u00b7 {cs['rejections']} rejected",
-                fg=theme.HEX_MUTED)
+                text=(f"{cs['invocations']} used \u00b7 {cs['rejections']} rejected "
+                      f"\u00b7 {health.summary()}"),
+                fg=theme.HEX_WARNING if health.failures else theme.HEX_MUTED)
         else:
             self.command_status.config(text=f"Ready ({cs['model']})",
                                        fg=theme.HEX_SUCCESS)
@@ -869,6 +893,7 @@ class WhisprFlowApp:
             self.stt.api_key,
             keyterms=self.dictionary.as_keyterms(),
             on_partial=self._on_partial,
+            batch_model=self.stt.model,
         )
         if not await session.open():
             logger.debug("streaming unavailable: %s", session.error)
@@ -1004,11 +1029,24 @@ class WhisprFlowApp:
         self.pill_locked(False)
         self.pill_command(False)
 
+        # The socket is ours to close from here on: every early return below
+        # must abort it, or the session stays open (billed on connection
+        # duration, and capped at 3 h) with nobody reading it (audit C2).
+        session, self._session = self._session, None
+        if session is not None:
+            # Ask the server to close the in-flight turn now instead of
+            # waiting for its own silence window -- this frame is what removes
+            # most of the "nothing happens when I let go" delay.
+            asyncio.run_coroutine_threadsafe(
+                session.force_endpoint(), self.loop)
+
         beep_async(660, 60)
         audio = self.capture.end()
         duration = time.monotonic() - self._start_time
 
         if audio is None or duration < 0.25:
+            if session is not None:
+                asyncio.run_coroutine_threadsafe(session.abort(), self.loop)
             self.pill_state(PillState.IDLE)
             self.log("Too short.", "warn")
             return
@@ -1017,11 +1055,12 @@ class WhisprFlowApp:
 
         if was_command:
             selected, self._pending_selection = self._pending_selection, ""
+            if session is not None:
+                asyncio.run_coroutine_threadsafe(session.abort(), self.loop)
             asyncio.run_coroutine_threadsafe(
                 self._run_command(audio, gen, selected), self.loop)
             return
 
-        session, self._session = self._session, None
         asyncio.run_coroutine_threadsafe(self._pipeline(audio, gen, session), self.loop)
 
     def cancel_recording(self):
@@ -1064,6 +1103,9 @@ class WhisprFlowApp:
             result = await self._transcribe(cleaned, session, gen)
             if self._stale(gen) or result is None:
                 return
+
+            if result.ok and result.latency_ms:
+                self._latency_ms.append(int(result.latency_ms))
 
             if not result.ok:
                 self.last_failed = True

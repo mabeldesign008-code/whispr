@@ -157,10 +157,27 @@ class TestCommandProcessor:
         # Fails on the missing key, not on size.
         assert "too large" not in (r.error or "").lower()
 
-    def test_uses_the_heavier_model(self):
+    def test_uses_a_reasoning_grade_model_with_fallbacks(self):
         """Transformations are reasoning tasks and run once per invocation,
-        unlike per-utterance dictation cleanup."""
-        assert "70b" in CommandProcessor().model
+        unlike per-utterance dictation cleanup -- so the default is the
+        heavier model, kept first in a fallback chain."""
+        cp = CommandProcessor()
+        assert "120b" in cp.model
+        assert cp.models[0] == cp.model
+        assert len(cp.models) >= 3, cp.models
+
+    def test_ships_no_deprecated_model_ids(self):
+        """Audit C1: both ids this app used to default to were retired by
+        Groq on 2026-08-16, which made every refinement fail silently. The
+        retired ids may sit at the END of the chain (older accounts can still
+        resolve them) but must never be the first thing tried."""
+        from refine.refiner import Refiner
+
+        retired = ("llama-3.1-8b-instant", "llama-3.3-70b-versatile")
+        for proc in (CommandProcessor(), Refiner(api_key="k")):
+            assert proc.model not in retired, proc.model
+            assert proc.models[0] not in retired, proc.models
+            assert any("gpt-oss" in m for m in proc.models), proc.models
 
     def test_set_api_key_resets_client(self):
         cp = CommandProcessor(api_key="old")
