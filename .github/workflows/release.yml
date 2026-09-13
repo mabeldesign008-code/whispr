@@ -1,0 +1,172 @@
+name: Build Windows release
+
+# Cross-compiling a Windows EXE from Linux is not possible with
+# PyInstaller, so the binary is built here on a real Windows runner.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (e.g. v1.0.0)"
+        required: true
+        default: "v1.0.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller==6.11.1
+
+      - name: Run tests
+        # Never ship a build that cannot pass its own suite.
+        run: python -m pytest -q
+
+      - name: Verify the app imports on Windows
+        # Catches Windows-only import errors before we spend 5 minutes
+        # packaging a binary that would crash on launch.
+        run: |
+          python -c "import main; print('main.py imports OK')"
+          python -c "import audio, stt, refine, ui, context; print('packages OK')"
+
+      - name: Build console probe
+        # A windowed EXE swallows stdout/stderr, so import failures are
+        # invisible to CI. This console twin runs the identical bundle and
+        # prints what actually happened. v1.0.0 shipped broken because the
+        # windowed binary showed an error DIALOG -- which keeps the process
+        # alive, so a "did it stay running?" check passed a crash.
+        run: >
+          pyinstaller --onefile --console --name WhisprFlowProbe
+          --distpath probe
+          --paths .
+          --collect-all numpy
+          --collect-all scipy
+          --collect-binaries sounddevice
+          --hidden-import pystray._win32
+          --hidden-import PIL._tkinter_finder
+          --hidden-import pynput.keyboard._win32
+          --hidden-import psutil
+          --hidden-import audio
+          --hidden-import stt
+          --hidden-import refine
+          --hidden-import context
+          --hidden-import ui
+          --noconfirm --clean
+          eval/import_probe.py
+
+      - name: Verify bundled imports actually work
+        shell: pwsh
+        run: |
+          Write-Host "Running import probe..."
+          & probe/WhisprFlowProbe.exe
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Bundled imports failed (exit $LASTEXITCODE)"
+            exit 1
+          }
+
+      - name: Build EXE
+        run: pyinstaller WhisprFlow.spec --noconfirm --clean
+
+      - name: Smoke-test the binary
+        shell: pwsh
+        run: |
+          if (-not (Test-Path dist/WhisprFlow.exe)) {
+            Write-Error "EXE was not produced"; exit 1
+          }
+          $size = (Get-Item dist/WhisprFlow.exe).Length / 1MB
+          Write-Host ("Built WhisprFlow.exe: {0:N1} MB" -f $size)
+          if ($size -lt 10) { Write-Error "EXE suspiciously small"; exit 1 }
+
+          $p = Start-Process -FilePath dist/WhisprFlow.exe -PassThru
+          Start-Sleep -Seconds 25
+
+          if ($p.HasExited) {
+            Write-Error "App exited immediately with code $($p.ExitCode)"
+            exit 1
+          }
+
+          # "Still running" is NOT sufficient: an unhandled-exception dialog
+          # keeps the process alive indefinitely. Fail if any error window
+          # or a second (crash-reporter) process appeared.
+          $dialogs = Get-Process |
+            Where-Object { $_.MainWindowTitle -match "exception|error|Failed to execute" }
+          if ($dialogs) {
+            $titles = ($dialogs | ForEach-Object { $_.MainWindowTitle }) -join "; "
+            Write-Error "Error dialog detected: $titles"
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            exit 1
+          }
+
+          Write-Host "App launched clean, no error dialogs."
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item dist/WhisprFlow.exe package/
+          Copy-Item README.md package/
+          Copy-Item docs/GETTING_STARTED.md package/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path package/* -DestinationPath WhisprFlow-windows.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WhisprFlow-windows
+          path: |
+            dist/WhisprFlow.exe
+            WhisprFlow-windows.zip
+          retention-days: 90
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version || github.ref_name }}
+          name: WhisprFlow ${{ github.event.inputs.version || github.ref_name }}
+          draft: false
+          prerelease: false
+          files: |
+            dist/WhisprFlow.exe
+            WhisprFlow-windows.zip
+          body: |
+            ## WhisprFlow — AI dictation for Windows
+
+            Hold **Ctrl + Win**, speak, release. Polished text appears at
+            your cursor in any application.
+
+            ### Install
+            1. Download **WhisprFlow.exe** below
+            2. Run it — Windows SmartScreen will warn because the binary is
+               unsigned. Click **More info → Run anyway**
+            3. Paste your AssemblyAI API key when the window opens
+               ([free, no card, ~185 hours](https://www.assemblyai.com/dashboard/signup))
+            4. Optionally add a Groq key for AI cleanup
+               ([free](https://console.groq.com/keys))
+
+            No Python install required.
+
+            ### What's in it
+            - AssemblyAI Universal-3.5 Pro, streaming — ~0.5 s after you stop
+            - Always-on mic with 500 ms pre-roll, so no clipped first syllable
+            - Guarded AI cleanup: rewrites that flip a negation, change a
+              number or drop a dictionary term are rejected
+            - Per-app formatting for code, terminals, chat, email, documents
+            - Custom dictionary that learns from repeated terms
+
+            Requires Windows 10/11 and an internet connection.

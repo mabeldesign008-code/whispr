@@ -1,0 +1,44 @@
+# ── Core ──────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0,<2.0.0
+pyperclip>=1.8.2,<2.0.0
+# pynput only -- running a second global hook (the `keyboard` package)
+# alongside it caused the two to intercept each other's synthetic events.
+pynput>=1.7.6,<2.0.0
+
+# httpx[http2] gives connection reuse between dictations.
+# The h2 extra is optional at runtime -- the client detects it and falls
+# back to HTTP/1.1 rather than crashing (see stt/assemblyai_client.py).
+httpx[http2]>=0.27.0,<0.29.0
+
+# ── Audio ─────────────────────────────────────────────────────────────
+# sounddevice keeps one 16 kHz mono stream open for the app's lifetime and
+# fills a pre-roll ring buffer, so the mic is already live when the hotkey
+# fires (see audio/capture.py).
+sounddevice>=0.4.6,<0.6.0
+numpy>=1.24.0,<3.0.0
+scipy>=1.11.0,<2.0.0
+
+# Speech recognition is AssemblyAI over plain HTTP via httpx -- no SDK
+# (the official one is synchronous and would block the asyncio loop).
+
+# ── Streaming (live partials + ~0.5s tail latency instead of ~2s) ─────
+# Optional: without it the app uses the batch endpoint and simply shows a
+# waveform instead of live text.
+websockets>=12.0,<16.0
+
+# ── App context (foreground window, focused control) ──────────────────
+# Optional: without these, refinement runs without app context.
+psutil>=5.9.0; sys_platform == "win32"
+uiautomation>=2.0.18; sys_platform == "win32"
+
+# ── GUI ───────────────────────────────────────────────────────────────
+Pillow>=10.1.0,<12.0.0
+pystray>=0.19.4,<0.20.0
+
+# ── Windows integration (shortcut creation) ───────────────────────────
+pywin32>=306; sys_platform == "win32"
+winshell>=0.6; sys_platform == "win32"
+
+# ── Dev / test ────────────────────────────────────────────────────────
+pytest>=7.4.0,<9.0.0
+pytest-asyncio>=0.21.0,<0.25.0

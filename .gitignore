@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Audio files
+*.wav
+*.mp3
+*.flac
+
+# Model files (large)
+sherpa_sensevoice/*.onnx
+
+# Temporary files
+*.tmp
+temp/
+tmp/
+
+# Kiro
+.kiro/
+
+# Serena
+.serena/cache/
+
+# Local model files
+models/*
+!models/*/
+!models/**/tokens.txt
+*.onnx
+
+# Eval data (your own recordings + transcripts)
+eval/clips/*
+!eval/clips/.gitkeep
+eval/reference.jsonl
+eval/results*.json
+
+# PyInstaller output
+build/
+dist/
+package/
+*.spec.bak
+NpOld.spec
+WhisprFlowProbe.spec
+probe/
+probe_old/

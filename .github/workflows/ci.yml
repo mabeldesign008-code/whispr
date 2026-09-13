@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux is fast and catches most regressions; Windows is where the
+        # app actually runs, and where platform-only import errors surface.
+        os: [ubuntu-latest, windows-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install system audio libs (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2 xvfb
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyflakes
+
+      - name: Lint for undefined names
+        # Scoped to real errors, not style. An undefined name shipped a
+        # crash-on-every-recording bug once already.
+        run: python -m pyflakes main.py audio ui stt refine context injector.py
+
+      - name: Unit tests
+        run: python -m pytest -q
+
+      - name: Mock API integration
+        run: python eval/mock_api_test.py
+
+      - name: Import probe (unfrozen)
+        # Same checks the packaged binary runs, so a missing dependency is
+        # caught on every push rather than at release time.
+        run: xvfb-run -a python eval/import_probe.py
+        if: runner.os == 'Linux'
+
+      - name: Import probe (Windows)
+        run: python eval/import_probe.py
+        if: runner.os == 'Windows' 
+
+      - name: Boot smoke test (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python eval/smoke_test.py
+
+      - name: Verify imports (Windows)
+        if: runner.os == 'Windows'
+        run: python -c "import main; print('OK')"

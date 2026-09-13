@@ -1,0 +1,37 @@
+# UTF-8
+#
+# Windows version resource. Without this the EXE shows up as a nameless
+# binary in Task Manager and Properties, which reads as malware to users
+# and to SmartScreen heuristics.
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 0, 0, 0),
+    prodvers=(1, 0, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          '040904B0',
+          [
+            StringStruct('CompanyName', 'mabeldesign008'),
+            StringStruct('FileDescription', 'WhisprFlow — AI dictation'),
+            StringStruct('FileVersion', '1.0.0.0'),
+            StringStruct('InternalName', 'WhisprFlow'),
+            StringStruct('LegalCopyright', 'MIT Licence'),
+            StringStruct('OriginalFilename', 'WhisprFlow.exe'),
+            StringStruct('ProductName', 'WhisprFlow'),
+            StringStruct('ProductVersion', '1.0.0.0'),
+          ]
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)
