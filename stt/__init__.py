@@ -3,7 +3,14 @@
 from .base import TranscriptionResult, WordInfo, float_to_wav_bytes
 from .assemblyai_client import AssemblyAIClient, clean_keyterms
 from .dictionary import UserDictionary, default_config_dir
-from .streaming import StreamingSession, websockets_available
+from .streaming import StreamingSession, websockets_available, streaming_model_for
+from .sync_transcribe import (
+    LiveSyncSession,
+    SyncConfig,
+    SyncTranscriber,
+    sync_keyterms,
+    sync_supported,
+)
 
 __all__ = [
     "TranscriptionResult",
@@ -15,4 +22,10 @@ __all__ = [
     "default_config_dir",
     "StreamingSession",
     "websockets_available",
+    "streaming_model_for",
+    "SyncTranscriber",
+    "SyncConfig",
+    "LiveSyncSession",
+    "sync_keyterms",
+    "sync_supported",
 ]

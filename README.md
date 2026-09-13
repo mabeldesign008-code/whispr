@@ -37,7 +37,8 @@ python main.py
 ## How it works
 
 ```
-always-on mic (500 ms pre-roll) → VAD → AssemblyAI (streaming)
+always-on mic (500 ms pre-roll) → VAD → AssemblyAI (streaming socket,
+Sync one-shot, or async upload)
    → Groq + per-app profile → guard → paste → auto-learn
 ```
 
@@ -51,13 +52,13 @@ drops a dictionary term — the raw transcript is used instead. See
 | Stage | Component |
 |---|---|
 | Capture | Always-on 16 kHz stream + pre-roll ring (`audio/`) |
-| Transcription | **AssemblyAI** — streaming partials, ~0.5 s tail |
+| Transcription | **AssemblyAI** — Sync one-shot for ≤120 s, streaming partials, async fallback |
 | Context | Foreground app via UI Automation (~5 ms) |
 | Profiles | Per-app formatting: code, terminal, chat, email, docs |
 | Command Mode | Select text, speak an instruction, rewritten in place |
 | Snippets | Voice-triggered text expansion, zero latency |
 | Dictionary | `%APPDATA%\WhisprFlow\user_dictionary.txt`, auto-learning |
-| Refinement | Groq `llama-3.1-8b-instant`, output verified by a guard |
+| Refinement | Groq `openai/gpt-oss-20b` (fallback chain), output verified by a guard |
 | Injection | Direct unicode ≤120 chars, else clipboard w/ restore |
 
 Architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
@@ -77,6 +78,12 @@ WHISPRFLOW_STREAMING=1      # live partials (default on)
 WHISPRFLOW_CONTEXT=1        # read foreground app (default on)
 WHISPRFLOW_READ_FIELD=0     # read focused field's text (default OFF)
 WHISPRFLOW_AUTOLEARN=1      # suggest dictionary terms (default on)
+
+WHISPRFLOW_SYNC_STT=1       # one-request transcription for <=120 s (default on)
+ASSEMBLYAI_SYNC_URL=https://sync.assemblyai.com   # or sync.us / sync.eu (data zone)
+WHISPRFLOW_SYNC_LIVE_UPLOAD=0  # upload while you talk (see docs/sync-live-upload.md)
+GROQ_REFINE_MODEL=openai/gpt-oss-20b     # refinement model id override
+GROQ_COMMAND_MODEL=openai/gpt-oss-120b   # command-mode model id override
 ```
 
 Keys can also be set in the UI (system tray → Transcription History).

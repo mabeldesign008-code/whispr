@@ -92,8 +92,108 @@ cancel can lose, and the send loop's buffer became a `bytearray` (see P4).
 Verified: `TestStreaming` is now 16 tests covering supersede, dedupe, repeat-final, word
 confidences and the terminate ordering.
 
-### C12/C13 · Sync endpoint, adaptive polling, key validation — ⬜ next commit
-Research already done (contracts in the entries below this line and in the audit report); code has
-not been written yet.
+### C12 · Batch-only transcription: three round trips + a poll floor — ✅
+New `stt/sync_transcribe.py` (Sync endpoint + live upload), wired into
+`AssemblyAIClient.transcribe`, which now prefers, in order: a finished **live
+upload** transcript → **Sync** one-shot → **async** upload/submit/poll. Takes
+over the documented 120 s cap go straight to async (`sync_supported`).
+Async polling also stopped sleeping a fixed 200 ms before its first look
+(`poll_interval` default 0.2 → 0.05, growth 1.35×, ceiling 1 s) and now
+handles 429/5xx/transport errors inside the poll loop instead of aborting the take.
+
+Measured here (localhost mock with a modelled **60 ms RTT** per request, median of 7
+takes, "wait after the user stops speaking"):
+
+| path | median |
+| --- | --- |
+| async, old fixed 200 ms first poll | **784 ms** |
+| async, adaptive poll | **431 ms** |
+| Sync one-shot (1 RTT) | **63 ms** |
+
+The 63 ms is the request *shape* win (3 round trips → 1), not a claim about
+real inference time — AssemblyAI's own example response reports
+`request_time_ms: 243.7` for a 101 s clip. The live-upload number came out the
+same as one-shot here because the harness feeds audio in a tight loop instead of
+in real time; its win is upload-bytes-during-speech, which needs a real
+microphone (or a paced harness) to measure.
+
+Research:
+- endpoint/auth/multipart contract and required header:
+  <https://www.assemblyai.com/docs/api-reference/sync-api/transcribe> —
+  `POST https://sync.assemblyai.com/transcribe`, `X-AAI-Model` **required**
+  (canonical `universal-3-5-pro`), `Authorization` raw key (Bearer optional),
+  multipart `audio` part typed `audio/wav` or `audio/pcm`, optional `config`
+  JSON part; response `text`, `words[]`, `confidence`, `audio_duration_ms`,
+  `session_id`, `request_time_ms`.
+- limits: <https://www.assemblyai.com/docs/sync-stt/audio-requirements> —
+  80 ms … 120 s, ≤40 MB, 16-bit, mono/stereo, sample rates
+  {8000,16000,22050,24000,32000,44100,48000}, and "For raw PCM, pass
+  `sample_rate` and `channels` in the config part"; longer than 120 s →
+  Pre-recorded (which is what the client now falls back to).
+- live upload: <https://www.assemblyai.com/docs/sync-stt/getting-started/transcribe-live-audio>
+  + <https://www.assemblyai.com/docs/api-reference/sync-api/transcribe-live> —
+  `POST /v1/transcribe/live`, `config` part **required and first, ahead of
+  `audio`**, `audio` typed `audio/pcm`, "upload audio as your code produces
+  it, so authorization, the upload, and every speech segment but the last are
+  done by the time the speaker stops". Because httpx's `files=` is
+  buffered/one-shot, the live body is hand-encoded and streamed with
+  `content=`. It is **off by default** (`WHISPRFLOW_SYNC_LIVE_UPLOAD=1`),
+  documented in `docs/sync-live-upload.md`, and only opened when the streaming
+  WebSocket is not already carrying the take.
+- errors: <https://www.assemblyai.com/docs/sync-stt/error-handling> —
+  `{"error_code","message"}` for audio/capacity/inference vs `{"detail"}` for
+  auth/rate-limit; 429/503 transient and honour `Retry-After`; "400, 413, and
+  415 indicate a problem with the request itself"; "500 and 504 are safe to
+  retry once". Implemented as: one retry for 429/503 (≤ `Retry-After` 1 s,
+  capped) and 500/504, no retry for 400/413/415 → fall back to async.
+- pre-warming: <https://www.assemblyai.com/docs/sync-stt/connection-pre-warming>
+  — `GET /warm` unauthenticated, "the ideal moment … is when you know audio is
+  coming but don't have it yet", "httpx drops idle connections after 5 seconds
+  by default", and "pre-warming only helps if the /warm and /transcribe
+  requests share a connection pool". Implemented as `SyncTranscriber.warm()`
+  on the *shared* client, called at hotkey press, with `keepalive_expiry=60`
+  and `pool=2.0` so a stall cannot masquerade as a provider timeout.
+- keyterms/prompt caps: <https://www.assemblyai.com/docs/sync-stt/prompting-and-keyterms>
+  — `keyterms_prompt` max **100 terms / 8000 characters** total, prompt ≤ 6000
+  chars, and "including a large number of terms or common terms … could lead to
+  overcorrections and hallucinations", plus the note that `language_code` is
+  ignored when a custom `prompt` is set. Implemented as `sync_keyterms()`
+  (drops obvious filler singletons, caps 100/8000) and `SyncConfig.as_json()`
+  omitting `language_code` whenever a prompt is sent.
+
+Verified: `eval/mock_api_test.py` sections 6–9 (37 new checks) drive the mock
+through the real `AssemblyAIClient`, asserting the header set (`authorization`
+without `Bearer`, `X-AAI-Model`), multipart part order and per-part content
+types, raw-PCM byte count (`2 × samples`, no RIFF header), `sample_rate`/
+`channels` in the config part, prompt forwarding, keyterm filtering, the
+>120 s → async route, 400 → async fallback, 401 → immediate "rejected the key"
+with exactly one request, 503 → one retry honouring `Retry-After`, live-upload
+config-first ordering, and `GET /warm`. Plus 14 unit tests in
+`TestSyncClient`/`TestKeyValidation`. 222 pytest tests, smoke test, import
+probe and pyflakes all green.
+
+### C13 · No key validation — ✅
+`AssemblyAIClient.validate_key()` calls `GET /v2/account` and returns
+`(True/False/None, message)`; `main.py`'s save button now runs it and reports
+"Key verified (credits_amount=…)" / "AssemblyAI rejected that key" *before* any
+audio is sent, with `None` reserved for "couldn't reach the API" so an offline
+machine is never told its key is wrong. `session_id` is kept on every result
+(`stt/base.py`) and shown on the status page, since that is what support asks
+for when a transcript is wrong.
+
+Research: <https://www.assemblyai.com/blog/speech-to-text-api-fundamentals> —
+"send your API key in the authorization header … **no Bearer prefix** … If your
+key is valid, you get a 200 … If it's missing or wrong, you get a 401. That's
+your authentication smoke test before you send any audio";
+<https://docs.redhuntlabs.com/docs/exposure-risks/credentials/assemblyai_api_key> —
+`curl -X GET "https://api.assemblyai.com/v2/account" -H "authorization: [KEY]"`
+as the way to verify a key is active. `session_id` requirement from the error
+page above.
+
+⚠️ Not verifiable from this sandbox: the endpoint itself. `api.assemblyai.com`
+answers 401 to an unauthenticated probe (endpoint alive), but there is no key
+here, so `Sync`/`/v2/account` behaviour is implemented **to the documented
+contract** and exercised against a mock that mirrors that contract, not against
+the live service.
 
 ---

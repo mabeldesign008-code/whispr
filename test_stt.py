@@ -318,6 +318,152 @@ def _client(client):
     return _get
 
 
+# ── sync endpoint (audit C12) ─────────────────────────────────────────────
+
+class TestSyncClient:
+    def _mod(self):
+        from stt import sync_transcribe as S
+        return S
+
+    def test_rejects_takes_the_endpoint_cannot_accept(self):
+        S = self._mod()
+        assert S.sync_supported(16000 * 5, 16000) is True
+        assert S.sync_supported(16000 * 121, 16000) is False, "vendor cap is 120 s"
+        assert S.sync_supported(1600, 16000, 0.05) is False, "vendor floor is 80 ms"
+        # 44.1 kHz is in the documented list; anything off it is not.
+        for rate in (8000, 16000, 22050, 24000, 32000, 44100, 48000):
+            assert S.sync_supported(rate * 2, rate) is True, rate
+        assert S.sync_supported(44000 * 2, 44000) is False, "not a supported rate"
+
+    def test_pcm_is_raw_16bit_little_endian(self):
+        import numpy as _np
+
+        S = self._mod()
+        scale = _np.array([1.0, -1.0, 0.0], dtype=_np.float32) * 32767.0
+        pcm = S.float_to_pcm_bytes(_np.array([1.0, -1.0, 0.0], dtype=_np.float32),
+                                   16000)
+        assert pcm == scale.astype("<i2").tobytes(), "S16LE, full scale"
+        assert len(pcm) == 6 and pcm[:2] == b"\xff\x7f"
+
+    def test_config_json_for_raw_pcm_carries_rate_and_channels(self):
+        S = self._mod()
+        import json as _json
+
+        cfg = _json.loads(S.SyncConfig(sample_rate=16000).as_json(raw_pcm=True))
+        assert cfg["sample_rate"] == 16000 and cfg["channels"] == 1
+        assert cfg["timestamps"] is True
+
+    def test_prompt_suppresses_language_code(self):
+        """Documented: language_code is ignored when a custom prompt is set,
+        so sending both would imply a control that does nothing."""
+        import json as _json
+
+        S = self._mod()
+        cfg = S.SyncConfig(prompt="Dictation in Outlook", language_code="en")
+        body = _json.loads(cfg.as_json())
+        assert body["prompt"] == "Dictation in Outlook"
+        assert "language_code" not in body
+        assert "language_code" in _json.loads(
+            S.SyncConfig(language_code="de").as_json())
+
+    def test_prompt_is_clipped_to_the_documented_cap(self):
+        S = self._mod()
+        assert len(S.clip_prompt("word " * 3000)) <= S.MAX_PROMPT_CHARS
+
+    def test_keyterms_use_the_sync_caps(self):
+        S = self._mod()
+        out = S.sync_keyterms(["like", "ok", "the", "WhisprFlow", "WhisprFlow"])
+        assert out == ["WhisprFlow"], out
+        big = S.sync_keyterms([f"term{i}" for i in range(500)])
+        assert len(big) == S.MAX_KEYTERMS == 100
+        total = sum(len(t) for t in big)
+        assert total <= S.MAX_KEYTERMS_CHARS
+
+    def test_too_short_is_not_an_error_just_not_for_sync(self):
+        import numpy as _np
+
+        S = self._mod()
+        t = S.SyncTranscriber(api_key="k")
+        out = asyncio.run(t.transcribe(_np.zeros(400, dtype=_np.float32), 16000))
+        assert out.fall_back and not out.ok
+
+    def test_no_key_fails_locally(self):
+        import numpy as _np
+
+        S = self._mod()
+        out = asyncio.run(S.SyncTranscriber(api_key="").transcribe(
+            _np.ones(16000, dtype=_np.float32), 16000))
+        assert not out.ok and "key" in out.result.error.lower()
+
+    def test_error_shapes_are_both_read(self):
+        """400/413/415 use {"error_code","message"}; 401/429 use {"detail"}."""
+        import httpx as _h
+
+        S = self._mod()
+
+        def resp(body: str):
+            return _h.Response(400, content=body.encode(),
+                               headers={"content-type": "application/json"})
+
+        assert S._error_fields(resp('{"error_code":"bad_audio","message":"misaligned"}')) \
+            == ("bad_audio", "misaligned")
+        assert S._error_fields(resp('{"detail":"unauthorized"}')) == ("", "unauthorized")
+
+    def test_retry_after_is_bounded(self):
+        import httpx as _h
+
+        S = self._mod()
+        assert S._retry_after(_h.Response(429, headers={"retry-after": "2"})) == 2.0
+        assert S._retry_after(_h.Response(429, headers={"retry-after": "600"})) == 5.0
+        assert S._retry_after(_h.Response(429, headers={"retry-after": "junk"})) == 1.0
+        assert S._retry_after(_h.Response(429)) is None
+
+
+class TestKeyValidation:
+    """Audit C13: a wrong key used to be discovered by a failed dictation."""
+
+    def _client(self, handler):
+        import httpx as _h
+
+        from stt.assemblyai_client import AssemblyAIClient
+
+        c = AssemblyAIClient(api_key="k", sync_enabled=False)
+        c._client = _h.AsyncClient(transport=_h.MockTransport(handler),
+                                   base_url="http://mock")
+        return c
+
+    def test_200_is_valid(self):
+        import httpx as _h
+
+        c = self._client(lambda r: _h.Response(200, json={"credits_amount": 7}))
+        ok, msg = asyncio.run(c.validate_key())
+        assert ok is True and "7" in msg
+        assert r"Bearer" not in str(c._client.headers.get("authorization"))
+
+    def test_401_is_reported_as_a_key_problem(self):
+        import httpx as _h
+
+        c = self._client(lambda r: _h.Response(401, json={"detail": "nope"}))
+        ok, msg = asyncio.run(c.validate_key())
+        assert ok is False and "401" in msg
+
+    def test_network_error_is_not_reported_as_a_bad_key(self):
+        import httpx as _h
+
+        def boom(request):
+            raise _h.ConnectError("offline")
+
+        c = self._client(boom)
+        ok, msg = asyncio.run(c.validate_key())
+        assert ok is None and "Could not reach" in msg
+
+    def test_no_key_short_circuits(self):
+        from stt.assemblyai_client import AssemblyAIClient
+
+        ok, msg = asyncio.run(AssemblyAIClient(api_key="").validate_key())
+        assert ok is False and "No API key" in msg
+
+
 # ── dictionary ────────────────────────────────────────────────────────────
 
 class TestDictionary:

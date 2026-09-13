@@ -501,9 +501,37 @@ class WhisprFlowApp:
             return
         self._persist("ASSEMBLYAI_API_KEY", key)
         self.stt.set_api_key(key)
-        self.log("AssemblyAI key saved.", "ok")
         self._refresh_status()
-        asyncio.run_coroutine_threadsafe(self.stt.warmup(), self.loop)
+        # "If your key is valid, you get a 200 ... If it's missing or wrong,
+        # you get a 401. That's your authentication smoke test before you send
+        # any audio." -- the save button is the only moment where a wrong key
+        # can be reported before it costs the user a dictation.
+        asyncio.run_coroutine_threadsafe(self._check_assemblyai_key(), self.loop)
+
+    async def _check_assemblyai_key(self):
+        try:
+            ok, msg = await self.stt.validate_key()
+        except Exception as e:
+            ok, msg = None, f"could not check: {e}"
+        if ok:
+            self.log(f"AssemblyAI key saved. {msg}", "ok")
+            self._set_status_text(self.engine_sub, "Key verified \u00b7 " + msg)
+            await self.stt.warmup()
+            await self.stt.warm_sync()
+        elif ok is None:
+            self.log("AssemblyAI key saved, but it could not be verified offline.", "warn")
+            self._set_status_text(self.engine_sub, "Saved \u00b7 not verified: " + msg)
+        else:
+            self.log(f"AssemblyAI key rejected: {msg}", "error")
+            self._set_status_text(self.engine_sub, "Key rejected: " + msg)
+            self.after_ui(lambda: messagebox.showwarning(
+                "WhisprFlow",
+                "AssemblyAI rejected that key.\n\n" + msg +
+                "\n\nNothing was sent for transcription."))
+
+    def _set_status_text(self, widget, text):
+        """Apply a label change from the asyncio thread safely."""
+        self._ui(lambda: widget.config(text=text))
 
     def save_groq_key(self):
         key = self.groq_entry.get().strip()
@@ -600,8 +628,23 @@ class WhisprFlowApp:
         self.engine_label.config(
             text=f"AssemblyAI · {info['model']}",
             fg=theme.HEX_SUCCESS if info["configured"] else theme.HEX_WARNING)
-        self.engine_sub.config(
-            text="Ready" if info["configured"] else "Add an API key to start")
+        if not info["configured"]:
+            sub = "Add an API key to start"
+        else:
+            # Saying which path served the last takes is the difference
+            # between "it feels slow" being diagnosable and not (audit C12).
+            path = ("Sync ≤120 s" if info.get("sync_enabled") else "Async (upload+poll)")
+            if info.get("live_upload"):
+                path += " · live upload"
+            bits = [f"{path} · {info.get('sync_hits', 0)} fast, "
+                    f"{info.get('async_fallbacks', 0)} fell back"]
+            if info.get("last_error"):
+                bits.append(f"last error: {info['last_error']}")
+            if info.get("last_session_id"):
+                bits.append(f"request {info['last_session_id']}")
+            sub = "\n".join(bits)
+        self.engine_sub.config(text=sub, wraplength=280)
+        self._key_state = info["configured"]
 
         if hasattr(self, "mic_status_label"):
             if not self.capture.is_running:
@@ -851,6 +894,17 @@ class WhisprFlowApp:
 
         if self.streaming_enabled and self.stt.is_configured and not self.command_mode:
             asyncio.run_coroutine_threadsafe(self._open_stream(gen), self.loop)
+        elif self.stt.live_upload_enabled() and not self.command_mode:
+            # No socket, so the take would otherwise sit in the buffer until
+            # release. Live upload sends it as it is recorded instead; the
+            # transcript is usually waiting by the time the key comes up.
+            asyncio.run_coroutine_threadsafe(self._open_live(), self.loop)
+        elif self.stt.sync_available():
+            # The one-shot Sync request reuses whatever the warm-up opened.
+            # /warm is an unauthenticated no-op whose only job is DNS+TCP+TLS
+            # (docs/sync-stt/connection-pre-warming), so doing it while the
+            # user talks removes ~100 ms+ from a distant client's critical path.
+            asyncio.run_coroutine_threadsafe(self.stt.warm_sync(), self.loop)
 
         threading.Thread(target=self._watch_duration, args=(gen,),
                          daemon=True).start()
@@ -908,8 +962,35 @@ class WhisprFlowApp:
             chunk = self.capture.tail_since(sent)
             if chunk is not None and len(chunk):
                 session.feed(chunk)
+                self.stt.feed_live(chunk)
                 sent += len(chunk)
             await asyncio.sleep(0.08)
+
+    async def _open_live(self):
+        """Start the Sync live upload for this take. Best-effort by design:
+        if it does not open, the local buffer is still complete and the
+        one-shot request at stop time works exactly as before."""
+        try:
+            await self.stt.open_live(
+                self.capture.sample_rate,
+                keyterms=self.dictionary.as_keyterms(),
+                prompt=self._sync_prompt(),
+                language_code=self.stt.language_code,
+            )
+        except Exception as e:
+            logger.debug("live upload unavailable: %s", e)
+
+    def _sync_prompt(self) -> str:
+        """A short description of what is being dictated, for the Sync
+        `prompt` field ("describing the conversation"). Context is a strong
+        prior for ASR; keep it factual and never send field *content*."""
+        bits = ["Windows dictation typed into"]
+        ctx = self._live_context
+        if ctx is not None and not ctx.is_empty:
+            bits.append(ctx.as_prompt())
+        else:
+            bits.append("a desktop application")
+        return " ".join(bits)[:1200]
 
     def _on_partial(self, text: str):
         if not text or not self.is_recording:
@@ -1077,6 +1158,7 @@ class WhisprFlowApp:
         session, self._session = self._session, None
         if session is not None:
             asyncio.run_coroutine_threadsafe(session.abort(), self.loop)
+        asyncio.run_coroutine_threadsafe(self.stt.abort_live(), self.loop)
         beep_async(440, 90)
         self.pill_state(PillState.IDLE)
         self.log("Cancelled.", "dim")
@@ -1096,6 +1178,7 @@ class WhisprFlowApp:
             if self._stale(gen):
                 if session:
                     await session.abort()
+                await self.stt.abort_live()
                 return
 
             self.last_audio = (cleaned.samples, cleaned.sample_rate)
@@ -1177,9 +1260,17 @@ class WhisprFlowApp:
             self.pill_state(PillState.IDLE)
             return None
 
+        live = None
+        if self.stt.has_live():
+            # The upload finished (or didn't) while we were refining frames;
+            # asking now costs one read instead of a whole round trip.
+            live = await self.stt.finish_live()
+
         return await self.stt.transcribe(
             cleaned.samples, cleaned.sample_rate,
             keyterms=self.dictionary.as_keyterms(),
+            prompt=self._sync_prompt(),
+            live=live,
         )
 
     async def _refine(self, raw: str, result) -> str:

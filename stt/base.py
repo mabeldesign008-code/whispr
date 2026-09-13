@@ -39,6 +39,13 @@ class TranscriptionResult:
     ok: bool = True
     error: Optional[str] = None
 
+    #: Provider request ids. AssemblyAI asks for these in support tickets
+    #: ("Include the session_id from the response"), and without them a
+    #: "my transcript was wrong" report has nothing to look up. They cost one
+    #: field and are logged with every take.
+    session_id: Optional[str] = None
+    request_time_ms: Optional[int] = None
+
     @property
     def is_empty(self) -> bool:
         return not self.text.strip()
