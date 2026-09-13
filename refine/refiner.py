@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections import deque
+from collections import OrderedDict, deque
 from typing import List, Optional
 
 import httpx
@@ -115,7 +115,17 @@ class Refiner:
         self.articulate_mode = False
 
         self._client: Optional[httpx.AsyncClient] = None
-        self._history: deque = deque(maxlen=context_turns)
+        # Rolling context for the prompt, scoped per application (audit C7).
+        # A single global deque meant a cancelled sentence in Slack could be
+        # re-injected as EARLIER: into the next Outlook take -- both a leak
+        # across contexts and, by OWASP's LLM01 definition, a prompt-injection
+        # carrier: the previous output is text the model was told to treat as
+        # authoritative context, and it is regenerated from whatever the user
+        # dictated (or pasted) last.
+        self._context_turns = context_turns
+        self._history: "OrderedDict[str, deque]" = OrderedDict()
+        self._history_scopes = 8
+        self._history_scope = ''
 
         self.last_rejected: Optional[str] = None
         self.rejections = 0
@@ -161,6 +171,7 @@ class Refiner:
         app_context: str = "",
         profile_instruction: str = "",
         allow_restructure: Optional[bool] = None,
+        history_scope: str = "",
     ) -> str:
         """Return refined text, or the deterministically-cleaned original if
         refinement is unavailable or rejected by the guard."""
@@ -177,6 +188,7 @@ class Refiner:
         )
 
         self.calls += 1
+        self._history_scope = history_scope
         health.note_call(HEALTH_SOURCE)
         try:
             client = await self._get_client()
@@ -277,7 +289,7 @@ class Refiner:
                     text, "no Groq model id in the candidate list was usable: "
                     + ", ".join(self.models))
 
-            self._history.append(refined)
+            self.history(self._history_scope).append(refined)
             return refined
 
         except Exception as exc:
@@ -308,6 +320,32 @@ class Refiner:
             return f"{base}\n\nCONTEXT FOR THIS APP:\n{profile_instruction}"
         return base
 
+    def history(self, scope: str = "") -> deque:
+        """The rolling deque for one scope ("" = one shared history)."""
+        key = (scope or "").strip().lower()
+        if key not in self._history:
+            self._history[key] = deque(maxlen=self._context_turns)
+            # Bound the number of *scopes* as well as the number of turns: an
+            # app that opens fifty windows must not grow this without limit.
+            while len(self._history) > self._history_scopes:
+                self._history.popitem(last=False)
+        else:
+            self._history.move_to_end(key)      # LRU touch
+        return self._history[key]
+
+    def clear_history(self, scope: Optional[str] = None) -> int:
+        """Forget the rolling context. Returns how many turns were dropped.
+
+        Called on cancel and whenever the take being refined is invalidated,
+        so text the user threw away can never come back as context.
+        """
+        if scope is None:
+            n = sum(len(d) for d in self._history.values())
+            self._history.clear()
+            return n
+        d = self._history.pop((scope or "").strip().lower(), None)
+        return len(d) if d else 0
+
     def _build_input(
         self,
         text: str,
@@ -322,8 +360,9 @@ class Refiner:
             parts.append("KNOWN TERMS: " + ", ".join(dictionary[:60]))
         if uncertain:
             parts.append("UNCERTAIN: " + ", ".join(dict.fromkeys(uncertain))[:400])
-        if self._history:
-            parts.append("EARLIER: " + " ".join(list(self._history)[-2:])[:300])
+        history = self.history(self._history_scope)
+        if history:
+            parts.append("EARLIER: " + " ".join(list(history)[-2:])[:300])
         parts.append(f"TEXT:\n{text}")
         return "\n".join(parts)
 
