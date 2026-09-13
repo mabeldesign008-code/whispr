@@ -33,14 +33,14 @@ the next call. 195 tests pass.
 Not checkable here: that the four ids resolve live for *this user's* account (a key is required;
 `GET /v1/models` returns `invalid_api_key` from the sandbox).
 
-### C2 · New `refine/api_health.py` — ✅
+### C1 (second half) · New `refine/api_health.py` — ✅
 `ApiHealth` counters (`calls/failures/http_errors/timeouts/fallbacks`, `last_error`, dead-model
 memory, `ordered()` candidate ordering, `summary()`), plus a shared `error_detail(resp)` helper.
 Motivation recorded in the module docstring: both Groq callers previously mapped *any* non-200 to
 `basic_cleanup()` with no trace anywhere. Verified: used by both callers; `summary()` shown in
 Settings.
 
-### C3 · Status text was hardcoded reassurance — ✅
+### U3 · Status text was hardcoded reassurance — ✅
 `main.py`: the refinement row now reads
 `{model_used} · NOT refining: {last_api_error}` (danger colour) when the last provider call failed,
 `{model_used} · guard blocked n/m (raw text kept)` on guard rejections; the mic row replaced the
@@ -48,7 +48,7 @@ constant `latency low` with a rolling `last N ms · avg M ms` measured from
 `TranscriptionResult.latency_ms` (`main.py` `_latency_ms` deque). Verified: `pytest`,
 `eval/smoke_test.py` (builds the whole Tk window, so the new `config(...)` kwargs are exercised).
 
-### C10 · Streaming never named a speech model — ✅
+### C2 · Streaming never named a speech model — ✅
 `stt/streaming.py`: `speech_model` is now a connection parameter, chosen by
 `streaming_model_for(batch_model)` from the *same* id the batch client uses (`main.py` passes
 `batch_model=self.stt.model`), and the app verifies the server's echo.
@@ -66,7 +66,7 @@ pinning plus the echo check is what closes both.
 Verified: `test_connection_params_name_the_model`, `test_batch_only_models_map_to_a_realtime_id`,
 `test_begin_echo_mismatch_degrades_the_session`, `test_begin_records_session_id_when_it_matches`.
 
-### C11 · `Terminate` without reading the flush — ✅
+### C5 · `Terminate` without reading the flush — ✅
 `close_and_finalise()` now sends `ForceEndpoint` → drains the pump → reads for 1.5 s → sends
 `Terminate` → reads again until `Termination` (or a bounded grace) → only then closes. `abort()`
 also sends `Terminate` and reads for 0.35 s instead of killing the socket mid-flush.
@@ -76,7 +76,12 @@ Research: <https://www.assemblyai.com/docs/streaming/message-sequence#session-te
 final (and formatted) `Turn` for audio you already sent … **Closing the socket as soon as you send
 `Terminate` silently discards your last transcript.**"
 
-### NEW · C14 (found while fixing C11) · streaming turns were appended, not superseded — ✅
+### C13 · `stop_recording` leaked the streaming session on a short take — ✅
+Every early return now aborts the session (report C13, first bullet): a session
+left open is billed on connection duration, unread, and capped at 3 h.
+
+### C14 · Streaming turns were appended, not superseded — ✅
+_new finding, added to the report as C14 while fixing C5_
 Vendor text: "Within a turn, each `Turn` message supersedes the previous one. Render the latest
 `transcript`; **do not append**. A turn is complete on the message where both `end_of_turn` and
 `turn_is_formatted` are `true`", and with `format_turns=true` "you receive two `end_of_turn: true`
@@ -92,7 +97,7 @@ cancel can lose, and the send loop's buffer became a `bytearray` (see P4).
 Verified: `TestStreaming` is now 16 tests covering supersede, dedupe, repeat-final, word
 confidences and the terminate ordering.
 
-### C12 · Batch-only transcription: three round trips + a poll floor — ✅
+### §3.1–3.3 · Batch-only transcription: three round trips + a poll floor — ✅
 New `stt/sync_transcribe.py` (Sync endpoint + live upload), wired into
 `AssemblyAIClient.transcribe`, which now prefers, in order: a finished **live
 upload** transcript → **Sync** one-shot → **async** upload/submit/poll. Takes
@@ -172,7 +177,7 @@ config-first ordering, and `GET /warm`. Plus 14 unit tests in
 `TestSyncClient`/`TestKeyValidation`. 222 pytest tests, smoke test, import
 probe and pyflakes all green.
 
-### C13 · No key validation — ✅
+### U3 (second half) · No key validation — ✅
 `AssemblyAIClient.validate_key()` calls `GET /v2/account` and returns
 `(True/False/None, message)`; `main.py`'s save button now runs it and reports
 "Key verified (credits_amount=…)" / "AssemblyAI rejected that key" *before* any
