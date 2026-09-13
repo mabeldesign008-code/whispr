@@ -9,6 +9,11 @@ repo's real code in this sandbox; nothing was simulated in place of the shipped 
 Measured baseline before changes: `pytest` **191 passed**, `eval/mock_api_test.py` all passed,
 `eval/smoke_test.py` all passed (under `xvfb-run`), `eval/import_probe.py` all ok, `pyflakes` clean.
 
+**Fix status.** Each id is tracked in `FIXLOG.md`, which records the change, the vendor or platform
+documentation behind it, and the verification that was run. One id in this report (C4) turned out not
+to be a bug — the retraction and the evidence are in its section, and re-verifying C4 before fixing
+it is what surfaced U6.
+
 ---
 
 ## 0. Verdict
@@ -126,33 +131,51 @@ Three distinct failure modes follow:
 - `if not await asyncio.to_thread(self.injector.inject, final): return self.pill_error(...)`.
 - Clear `last_text_injected` on injection failure.
 
-### 🔴 C4 — A stray Esc pressed mid-hold permanently disables the hotkey until the next Esc release
+### ⚪ C4 — RETRACTED: the Esc `pressed_keys` leak does not exist
 
-`main.py:1207-1212` deliberately returns early for Esc so it "can never pollute the set", but the
-guard is `if self.locked and self.is_recording:` — a **non-locked** Esc falls through to
-`self.pressed_keys.add(key)`. `on_release` only discards keys in `hotkey_combo | command_combo`
-(`main.py:1234-1235`), so an Esc pressed while Ctrl+Win is held (the natural panic reflex, and
-the documented "Esc to cancel" key) is added and never removed. The exact-match set test at
-`main.py:1222` then fails forever.
+**Verdict:** the mechanism this finding describes is not in the code, and the symptom it reports was
+an artifact of the probe. Kept in place of a fix, because the reasoning that produced it is the
+useful part.
 
-Reproduced against the real `on_press`/`on_release` (harness stubs only sounddevice/winsound/Tk,
-the state machine is `main.py`'s own code):
+The claim was that `on_press` guards the early `return` with `if self.locked and self.is_recording:`,
+so a non-locked Esc falls through to `self.pressed_keys.add(key)` and breaks the exact-match test
+forever. The shipped code is:
 
-```
-Ctrl+Win held → Esc pressed → release Win → release Ctrl   → pressed_keys after = {}
-  (recording ended normally; Esc had been released too)
-Ctrl+Win held → Esc pressed, Esc released last             → next Ctrl+Win press:
-   recording_started=False   ← hotkey dead
-   after one more Esc press+release: recording_started=True  ← recovers
+```python
+if key == keyboard.Key.esc:
+    if self.locked and self.is_recording:
+        self.cancel_recording()
+    return                       # ← outside the guard, so Esc is never added
 ```
 
-Note the existing test at `eval/smoke_test.py:252-257` covers the *press Esc, release Esc* order
-and passes; the press-while-held order is untested.
+`return` sits at the outer indentation level. Re-measured against the real `on_press`/`on_release`
+(stubs only for sounddevice/winsound/Tk/pystray/pynput, the state machine is `main.py`'s own code),
+`pressed_keys` is empty in every Esc ordering — released last, released first, and still held when
+the modifiers came up — and a fresh Ctrl+Win hold starts a recording in all three:
 
-**Fix:** in `on_press`, when `key == esc`: if `locked and is_recording` cancel; else
-`self.pressed_keys.discard(key)` and return. Better: discard on *every* release unconditionally
-(`self.pressed_keys.discard(key)` already is unconditional — the bug is the unconditional *add*,
-so gate the add with `if key in self.hotkey_combo | self.command_combo or self.is_recording`).
+```
+Esc pressed, Esc released last        → pressed_keys=[]  next hold: ['start']
+Esc released first                    → pressed_keys=[]  next hold: ['start']
+Esc still down when modifiers come up → pressed_keys=[]  next hold: ['start']
+```
+
+What the earlier probe was actually seeing: after `Ctrl+Win` down and up quickly the session is in
+**tap-to-lock** state (`is_recording=True, locked=True`), which is intended. A probe that then reads
+`is_recording` immediately after the *next* Ctrl+Win press sees `False` — because that press correctly
+*finishes* the locked take instead of starting one. A binary read of `is_recording` cannot distinguish
+"cancelled", "submitted", and "not mine to interpret". The fix was to instrument which of
+`start/stop/cancel_recording` fired; with that, the hotkey is alive in every ordering.
+
+Two things in this section were nonetheless worth shipping, and are:
+
+1. **Esc did nothing while the key was being held** — `locked` was required, so the documented panic
+   key only worked in the tap-to-lock mode. Now `Esc` cancels whenever `is_recording`.
+2. `test_hotkey.py` pins the emptiness of `pressed_keys` across the Esc orderings, so a later edit
+   that moves the `return` inside the guard fails immediately instead of becoming this report's
+   next false finding.
+
+**Related, and real (see U6):** the *right-hand* modifiers `ctrl_r`/`cmd_r` never enter the combo at
+all, and that was not in this report.
 
 ### 🟠 C5 — Cancelled or failed stream sessions can be billed for 3 hours
 
@@ -722,6 +745,29 @@ state (violet/blue/red/green at low contrast against a near-black pill — the m
 for success (the beeps are start/stop/lock only, `main.py:820, 999, 1247`) so a deaf user has no
 non-visual confirmation, and the pill is invisible to screen readers by construction.
 
+### ⚪ U6 — the right-hand Ctrl and Win keys cannot start or stop a dictation
+
+Found while re-verifying C4, not in the original pass. `hotkey_combo` is `{Key.ctrl_l, Key.cmd}` and
+`command_combo` is `{Key.ctrl_l, Key.shift, Key.cmd}` (`main.py:157-158, 165 (baseline)`). In pynput those are
+*not* aliases of the right-hand keys — measured against the real enum:
+
+```
+Key.ctrl   -> <Key.ctrl: 65507>      Key.ctrl_l  -> <Key.ctrl: 65507>   (same member)
+Key.shift  -> <Key.shift: 65505>     Key.shift_l -> <Key.shift: 65505>  (same member)
+Key.ctrl_r -> <Key.ctrl_r: 65508>    Key.cmd_r   -> <Key.cmd_r: 65516>  (distinct members)
+```
+
+So the left Ctrl and the left Super work, and a user whose hands sit on the right Ctrl, or who uses
+the right-hand Windows key, gets nothing: `ctrl_r + cmd` and `ctrl_l + cmd_r` both start no
+recording (measured on the real `on_press`). This is not a misfire risk — the exact-set comparison
+does its job — it is 100 % silence for a plausible hand position.
+
+**Fix shipped:** `WhisprFlowApp._canonical_key` folds `ctrl_r→ctrl_l`, `cmd_r→cmd`, `shift_r→shift_l`,
+`alt_r→alt_l` on both press and release, before the set comparisons. Folding on release matters as
+much as on press: a chord started with `ctrl_r` has to be *finished* by it, or the take hangs. The
+exact-set semantics stay, so Ctrl+Win+D is still refused. The alias table is built with `getattr` and
+cached, because which members a pynput backend exposes is not this app's business.
+
 ---
 
 ## 6. Security, privacy, robustness
@@ -822,6 +868,9 @@ Recommendations, in order of value per minute:
    (`monkeypatch time.monotonic`). That single change turns C4, C11 and the tap/lock contract into
    tested behaviour. Add the three regression tests for the findings above (Esc order, extra key,
    right-hand modifiers).
+   *Shipped as `test_hotkey.py` (23 tests, real `on_press`/`on_release`/`_anchor_ok`/`_inject`,
+   peripheral stubs only, an `IntEnum` whose aliases mirror pynput's so the folding is tested against
+   a faithful key space). The `test_audio.py` mirror is still open.*
 2. **Tests for the two untested data-loss modules.** For `TextInjector`: paste-path selection
    (≤120 direct type, >120 clipboard), restore-after-failure, and `inject` returning `False` on a
    clipboard exception. For `SelectionManager`: sentinel logic with a fake clock — slow app
@@ -868,7 +917,7 @@ Recommendations, in order of value per minute:
 | 1 | Groq model IDs → `openai/gpt-oss-20b` / `openai/gpt-oss-120b`, env-overridable; non-200 → visible error + counter (C1) | ~25 |
 | 2 | Pin `speech_model` on the streaming connect params + test (C2) | ~10 |
 | 3 | `Terminate` on `abort()` (C5) | ~3 |
-| 4 | Fix the Esc `pressed_keys` leak (C4) + 2 regression tests | ~5 |
+| 4 | ~~Esc `pressed_keys` leak (C4)~~ retracted; Esc cancels mid-hold, right-hand modifiers fold (U6), C11 cancel-on-extra-keys + `test_hotkey.py` | ~5 |
 | 5 | Check `inject()`'s return value; clear `last_text_injected` on failure (C3.3) | ~5 |
 | 6 | Warm `lfilter` at import; drop the `duration<0.25` session leak (P4, C13) | ~8 |
 | 7 | `git rm --cached` the pycache/log junk; fix README/issue URLs and the test count (7.7, 7.8) | ~20 |
@@ -910,7 +959,8 @@ Recommendations, in order of value per minute:
 | C1 | Retired Groq models; dictation degrades silently | 🔴 | `refiner.py:84,169`, `commands.py:114` |
 | C2 | Streaming pins no model; "same model" claim false | 🔴 | `streaming.py:96-101`, `main.py:1116` |
 | C3 | No focus/selection anchor; undo after failed inject | 🔴 | `main.py:1096,1251`, `injector.py` |
-| C4 | Esc mid-hold permanently kills the hotkey | 🔴 | `main.py:1207-1212,1234` |
+| C4 | ~~Esc mid-hold kills the hotkey~~ **retracted**; Esc-mid-hold cancel shipped | ⚪ | `main.py:1207-1212` |
+| U6 | Right-hand Ctrl/Win never trigger the hotkey | 🟡 | `main.py:157,165` |
 | C5 | No `Terminate` on abort → 3 h billed session | 🟠 | `streaming.py:268-275` |
 | C6 | `max_tokens` truncation invisible to guard in restructure mode | 🟠 | `refiner.py:165`, `guard.py:128-136` |
 | C7 | Refinement history leaks across takes/apps | 🟠 | `refiner.py:94,219` |

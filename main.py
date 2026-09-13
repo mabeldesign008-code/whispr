@@ -98,6 +98,87 @@ def _safe_beep(freq: int, ms: int) -> None:
         pass
 
 
+_GTI = None          # lazily built GUITHREADINFO structure type
+
+
+def _focus_signature():
+    """(foreground window, focused control, owning pid) as integers.
+
+    A paste can go wrong in two ways: the user Alt+Tabbed to another app, or
+    they clicked into a different field of the same window. The top-level
+    handle catches the first and the focused control catches the second, so
+    both are sampled. Two documented Windows behaviours shape the code:
+
+      * GetForegroundWindow returns NULL "in certain circumstances, such as
+        when a window is losing activation", and GetGUIThreadInfo "may not
+        return valid window handles ... when called to retrieve information
+        for the foreground thread" (learn.microsoft.com/windows/win32/api/
+        winuser/nf-winuser-getforegroundwindow, .../nf-winuser-getguithreadinfo).
+        So 0 means *unknown*, never *changed* -- a refusal has to be based on
+        two real values, or the app would refuse at random.
+      * The same GetGUIThreadInfo page says rcCaret "may not give the correct
+        position of the cursor" for an edit control, so the caret rectangle is
+        deliberately not part of the signature. hwndFocus is stable and free.
+
+    Cost is two Win32 calls with no allocation and no UI Automation, which is
+    what makes it possible to take the sample on the keyboard-hook thread.
+    """
+    global _GTI
+    if sys.platform != 'win32':
+        return 0, 0, 0
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = int(user32.GetForegroundWindow() or 0)
+        if not hwnd:
+            return 0, 0, 0
+
+        pid = ctypes.c_ulong(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+
+        if _GTI is None:
+            from ctypes.wintypes import RECT
+
+            class GUITHREADINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", ctypes.c_ulong), ("flags", ctypes.c_ulong),
+                    ("hwndActive", ctypes.c_void_p),
+                    ("hwndFocus", ctypes.c_void_p),
+                    ("hwndCapture", ctypes.c_void_p),
+                    ("hwndMenuOwner", ctypes.c_void_p),
+                    ("hwndMoveSize", ctypes.c_void_p),
+                    ("hwndCaret", ctypes.c_void_p),
+                    ("rcCaret", RECT),
+                ]
+            _GTI = GUITHREADINFO
+
+        focus = 0
+        if _GTI is not None:
+            info = _GTI()
+            info.cbSize = ctypes.sizeof(_GTI)
+            # idThread 0 == the foreground thread, per the docs.
+            if user32.GetGUIThreadInfo(0, ctypes.byref(info)) and info.hwndFocus:
+                focus = int(info.hwndFocus)
+        return hwnd, focus, int(pid.value or 0)
+    except Exception:
+        return 0, 0, 0
+
+
+def _foreground_hwnd() -> int:
+    """Just the top-level handle, for callers that only need that."""
+    return _focus_signature()[0]
+
+
+def _foreground_is_ours(sig) -> bool:
+    """True when our own overlay is what took focus.
+
+    The pill and the settings window are real Tk windows; if any of them ends
+    up in the foreground while the pipeline runs, comparing handles would
+    refuse a perfectly good paste. Same-pid means "the user did not change
+    app", so the anchor is left alone.
+    """
+    return bool(sig[2]) and sig[2] == os.getpid()
+
+
 class WhisprFlowApp:
     def __init__(self):
         self.dictionary = UserDictionary()
@@ -146,6 +227,11 @@ class WhisprFlowApp:
         self.last_audio = None
         self.last_text_injected = ""
         self.last_failed = False
+        # Window that was focused when the *release* happened. The pipeline
+        # runs 1-3 s later, and every one of those seconds is enough for the
+        # user to Alt+Tab; without this anchor the text is pasted into
+        # whatever is focused at injection time (audit C3).
+        self._focus_anchor = (0, 0, 0)
         self._start_time = 0.0
         self._partial = ""
 
@@ -1080,14 +1166,20 @@ class WhisprFlowApp:
                 self.pill_error(_preview(outcome.error or "Failed", 22))
                 return
 
-            # The selection is still highlighted, so pasting replaces it.
-            ok = await asyncio.to_thread(self.selection.replace, outcome.text)
-            if not ok:
-                self.log("Could not replace the selection.", "error")
-                self.pill_error("Replace failed")
+            if not await self._anchor_ok(outcome.text, require_selection=selected):
                 return
 
+            # Still paste rather than type: the selection has to be replaced
+            # in one operation, and `replace()` restores the clipboard.
+            if not await asyncio.to_thread(self.selection.replace, outcome.text):
+                self.last_text_injected = ''
+                self.last_failed = True
+                self.log('Could not replace the selection.', 'error')
+                self.pill_error('Replace failed')
+                self.pill_state(PillState.IDLE)
+                return
             self.last_text_injected = outcome.text
+
             self.log(f"\u2713 {_preview(outcome.text)}", "ok")
             self.pill_success(_preview(outcome.text, 22))
             self.refresh_status()
@@ -1107,6 +1199,7 @@ class WhisprFlowApp:
             was_command = self.command_mode
             self.command_mode = False
             gen = self.generation
+            self._focus_anchor = _focus_signature()
         self.pill_locked(False)
         self.pill_command(False)
 
@@ -1219,8 +1312,10 @@ class WhisprFlowApp:
             if self._stale(gen):
                 return
 
-            self.last_text_injected = final
-            await asyncio.to_thread(self.injector.inject, final)
+            if not await self._anchor_ok(final):
+                return
+            if not await self._inject(final):
+                return
 
             self.last_failed = False
             self.log(_preview(final), "ok")
@@ -1272,6 +1367,76 @@ class WhisprFlowApp:
             prompt=self._sync_prompt(),
             live=live,
         )
+
+    async def _anchor_ok(self, text: str, require_selection: str = "") -> bool:
+        """Is it still safe to write, and if not, salvage the text?
+
+        Two things have to be true after the 1-3 s the pipeline takes: the
+        window the user was dictating into is still focused, and -- in Command
+        Mode -- the selection we were given is still selected. Refusing is
+        cheap here because `stage()` leaves the text on the clipboard, so
+        "nothing was pasted" never means "the dictation is lost" (audit C3).
+        """
+        anchor = self._focus_anchor
+        if anchor[0]:
+            current = _focus_signature()
+            moved = bool(current[0]) and current[0] != anchor[0]
+            if _foreground_is_ours(current):
+                moved = False
+            # A different control in the same window is only a mismatch when
+            # both sides actually reported one; 0 means unknown (docs, above).
+            reentered = (not moved and anchor[1] and current[1]
+                         and current[1] != anchor[1])
+            if moved or reentered:
+                self.log('Focus moved to a different control'
+                         if reentered else 'Focus moved to another window', 'dim')
+                staged = await asyncio.to_thread(self.injector.stage, text)
+                self.last_text_injected = ''      # nothing was written: no undo
+                self.last_failed = True
+                self.log('Focus changed while processing — '
+                         + ('text is on the clipboard, paste it yourself.'
+                            if staged else
+                            'nothing was pasted, and it could not be copied either.'),
+                         'warn')
+                self.pill_error('Focus changed' if not staged else 'Copied — paste it')
+                self.pill_state(PillState.IDLE)
+                return False
+
+        if require_selection:
+            # A click, an arrow key or an Escape in the target app drops the
+            # highlight while the LLM runs; pasting then *inserts* the rewrite
+            # beside the original instead of replacing it.
+            now = await asyncio.to_thread(self.selection.capture)
+            if not now.ok or now.text != require_selection:
+                staged = await asyncio.to_thread(self.injector.stage, text)
+                self.last_text_injected = ''
+                self.last_failed = True
+                self.log('The selection changed — nothing was replaced'
+                         + ('; the rewrite is on the clipboard.' if staged else '.'),
+                         'warn')
+                self.pill_error('Selection changed')
+                self.pill_state(PillState.IDLE)
+                return False
+
+        return True
+
+    async def _inject(self, text: str) -> bool:
+        """Inject, and believe the result.
+
+        `inject()` returns a bool that main.py used to discard, so a failed
+        clipboard write or paste still set `last_text_injected` and the next
+        Ctrl+Alt+Z undid whatever the user had really done last.
+        """
+        if not await asyncio.to_thread(self.injector.inject, text):
+            self.last_text_injected = ''
+            self.last_failed = True
+            self.log('Injection failed — the paste did not happen.', 'error')
+            self.pill_error('Paste failed')
+            self.pill_state(PillState.IDLE)
+            return False
+        self.last_text_injected = text
+        self.last_failed = False
+        return True
 
     async def _refine(self, raw: str, result) -> str:
         if not (self._refine_on and self.refiner.is_configured):
@@ -1332,13 +1497,54 @@ class WhisprFlowApp:
     # Below this, a press counts as a "tap" (lock on) rather than a hold.
     TAP_SECONDS = 0.35
 
+    _KEY_ALIASES = None
+
+    @classmethod
+    def _key_aliases(cls) -> dict:
+        """Right-hand modifiers mapped onto their left-hand twins.
+
+        Built with getattr and cached, because which members exist is a
+        property of the pynput backend (and of test stubs), not of this app.
+        In pynput `Key.ctrl is Key.ctrl_l` already, so only the _r variants
+        need folding; a missing member is simply not aliased.
+        """
+        if cls._KEY_ALIASES is None:
+            K = keyboard.Key
+            pairs = (("ctrl_r", "ctrl_l"), ("cmd_r", "cmd"),
+                     ("shift_r", "shift_l"), ("alt_r", "alt_l"))
+            alias = {}
+            for right, left in pairs:
+                r = getattr(K, right, None)
+                l = getattr(K, left, None) or getattr(K, right[:-2], None)
+                if r is not None and l is not None and r is not l:
+                    alias[r] = l
+            cls._KEY_ALIASES = alias
+        return cls._KEY_ALIASES
+
+    @classmethod
+    def _canonical_key(cls, key):
+        """Fold right-hand modifiers onto their left-hand twins.
+
+        `hotkey_combo` is {ctrl_l, cmd}, so a user whose hands are on the
+        right Ctrl, or who uses cmd_r, could never trigger the app at all --
+        measured against the real methods: ctrl_r+cmd and ctrl_l+cmd_r both
+        do nothing. Folding keeps the *exact-set* semantics that stop
+        Ctrl+Win+D from firing a phantom take, while accepting either side of
+        the keyboard.
+        """
+        return cls._key_aliases().get(key, key)
+
     def on_press(self, key):
-        # Esc cancels a locked recording -- with hands free, reaching for
-        # the pill with the mouse is the wrong reflex. Handled before the
-        # key joins pressed_keys, so a stray Esc can never pollute the set
-        # and permanently break the exact-match hotkey test below.
+        key = self._canonical_key(key)
+        # Esc cancels a recording -- with hands free, reaching for the pill
+        # with the mouse is the wrong reflex. Handled *before* the key joins
+        # pressed_keys, so a stray Esc can never pollute the set and break the
+        # exact-match hotkey test below (this is what the audit's C4 claimed
+        # was missing; the guard was already correct, see the retraction in
+        # AUDIT_PERF_UI_ACCURACY_2026-09-13.md). It used to require `locked`,
+        # which meant the panic key did nothing during an ordinary hold.
         if key == keyboard.Key.esc:
-            if self.locked and self.is_recording:
+            if self.is_recording:
                 self.cancel_recording()
             return
 
@@ -1364,9 +1570,25 @@ class WhisprFlowApp:
             self.start_recording()
 
     def on_release(self, key):
+        key = self._canonical_key(key)
         was_hotkey = key in self.hotkey_combo or key in self.command_combo
         self.pressed_keys.discard(key)
         if not (was_hotkey and self.is_recording and self._press_time):
+            return
+
+        # Anything still held that is not part of either combo means the
+        # chord was really Ctrl+Win+<something>. That is Windows' own
+        # vocabulary -- Ctrl+Win+D makes a new desktop, Ctrl+Win+arrows switch
+        # between them -- and the user was not dictating. Starting on such a
+        # chord is already refused; the *stop* was not, so the system chime and
+        # whatever the user said next became a take and got pasted (audit C11).
+        # Cancel, do not transcribe.
+        combo = self.command_combo if self.command_mode else self.hotkey_combo
+        extras = {k for k in (self.pressed_keys - combo) if k != keyboard.Key.esc}
+        if extras:
+            self.cancel_recording()
+            self.log('Ignored: ' + ', '.join(getattr(k, 'name', str(k)) for k in extras)
+                     + ' was held, so this was not a dictation.', 'dim')
             return
 
         held = time.monotonic() - self._press_time

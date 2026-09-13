@@ -202,3 +202,96 @@ contract** and exercised against a mock that mirrors that contract, not against
 the live service.
 
 ---
+
+
+---
+
+## C3 — focus anchor, and believing `inject()` (Batch 2)
+
+**Files:** `main.py` (`_focus_signature`, `_foreground_is_ours`, `_anchor_ok`, `_inject`,
+`stop_recording`), `injector.py` (`stage`), `test_hotkey.py`
+
+**Research.** The anchor needs the two handles Win32 exposes for free. `GetForegroundWindow`
+"retrieves a handle to the foreground window (the window with which the user is currently
+working)" and — the part that decides the code's shape — "can be **NULL** in certain circumstances,
+such as when a window is losing activation"
+([learn.microsoft.com/windows/win32/api/winuser/nf-winuser-getforegroundwindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getforegroundwindow)).
+`GetGUIThreadInfo(0, …)` with `idThread` 0 "returns information for the foreground thread", giving
+`hwndFocus` — the control that would actually receive the paste — and its remarks warn twice: "the
+function may not return valid window handles in the `GUITHREADINFO` structure when called to retrieve
+information for the foreground thread, such as when a window is losing activation", and "for an edit
+control, the returned **rcCaret** rectangle contains the caret plus information on text direction and
+padding. Thus, it may not give the correct position of the cursor"
+([learn.microsoft.com/windows/win32/api/winuser/nf-winuser-getguithreadinfo](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getguithreadinfo)).
+
+Three design consequences, each traceable to a sentence above:
+
+* A `0` from either call means *unknown*, never *changed*. The comparison refuses only when both
+  snapshots are real, or the app would drop valid pastes exactly when Windows is mid-activation.
+* `rcCaret` is not used. The caret rectangle is documented as unreliable for edit controls, so a
+  caret-position signature would produce false refusals in the very app class that matters most;
+  `hwndFocus` is stable, cheap, and catches the "clicked into another field" case.
+* UI Automation is not used. `selection.py` already shows what a UIA round trip costs in latency and
+  failure modes, and the anchor is sampled twice per take on a timing-critical path.
+
+**Change.** `stop_recording` snapshots `(hwnd, hwndFocus, pid)` on the keyboard-hook thread — the
+only moment that can be sampled with no extra machinery, and the moment the user's intent is defined.
+Before writing, `_anchor_ok` re-samples and refuses if the top-level window changed or the focused
+control changed. If the new foreground window belongs to *this* process (`pid == os.getpid()`) the
+refusal is suppressed: the pill or the settings window coming forward is not the user changing apps,
+and treating it as such would refuse every paste the moment a tooltip appears. On refusal the text
+goes through the new `injector.stage()` — clipboard, no keys — so refusing never means losing. In
+Command Mode the captured selection is re-captured and compared, because a click, an arrow key or an
+Escape in the target app drops the highlight while the LLM runs and the paste then *inserts* the
+rewrite beside the original instead of replacing it.
+
+`_inject` now reads `inject()`'s return value. It has always returned a bool; `main.py` discarded it,
+so a failed clipboard write or a failed paste still set `last_text_injected`, and the next
+`Ctrl+Alt+Z` undid whatever the user had really last changed in the document — a failure that is
+invisible until it destroys something.
+
+## C11 — a chord with an extra key is not a dictation
+
+**Files:** `main.py` (`on_release`), `test_hotkey.py`
+
+`on_press` refuses to start on Ctrl+Win+<anything> because the combo test is an exact set match, but
+*stopping* had no such rule: `Ctrl+Win+D` (new virtual desktop), `Ctrl+Win+arrows` (switch desktop)
+started a take on the way in and submitted it on the way out — measured: `events=['start','stop']`
+with a 1.2 s take handed to the pipeline. `on_release` now computes
+`pressed_keys - the combo actually in use` before deciding, and cancels if anything but Esc is left.
+`command_combo` is subtracted in command mode so Ctrl+Shift+Win does not look like an intrusion
+(`shift` belongs to one combo and not the other — that asymmetry is the whole bug).
+
+## U6 — right-hand Ctrl and Win never fired
+
+**Files:** `main.py` (`_key_aliases`, `_canonical_key`, `on_press`, `on_release`), `test_hotkey.py`
+
+`hotkey_combo` is `{ctrl_l, cmd}`, and in pynput the bare `Key.ctrl`/`Key.shift` *are* the left-hand
+members while `ctrl_r`/`cmd_r`/`shift_r`/`alt_r` are distinct ones — verified in this environment:
+`Key.ctrl -> <Key.ctrl: 65507>` and `Key.ctrl_l -> <Key.ctrl: 65507>` are the same member, while
+`Key.ctrl_r -> <Key.ctrl_r: 65508>` is not. Pressing the right Ctrl with the left Super, or the left
+Ctrl with the right Super, started nothing (measured against the real `on_press`).
+
+`_canonical_key` folds the right-hand members onto their left-hand twins before every comparison, on
+release as well as press — folding only the press would leave a take started by `ctrl_r` unfinishable.
+The alias table is built with `getattr` and cached, since which members exist is a property of the
+pynput backend (and of test stubs), not of this app. Exact-set semantics are untouched: Ctrl+Win+D
+still does nothing.
+
+## C4 — retracted: the Esc leak is not in the code
+
+**Files:** `AUDIT_PERF_UI_ACCURACY_2026-09-13.md`, `test_hotkey.py`
+
+The finding said a non-locked Esc falls through into `pressed_keys`. It does not: the `return` in the
+Esc branch is outside the `locked` guard, and `pressed_keys` measured empty in all three Esc
+orderings with the hotkey working afterwards. The original reproduction read `is_recording` right
+after the next Ctrl+Win press while the session was in tap-to-lock state — that press legitimately
+*finishes* the locked take, so `is_recording=False` was misread as a dead hotkey. Instrumenting which
+of `start/stop/cancel_recording` fired is what separated the two.
+
+Two real items came out of the re-verification and are shipped: `Esc` now cancels an ordinary hold as
+well as a locked one (it required `locked`, so the documented panic key did nothing mid-hold), and
+`test_hotkey.py` pins `pressed_keys` across the orderings so the claim cannot come back. **No fix was
+made to the add-gate, because there was nothing to fix** — and the guard the finding proposed adding
+(`if key in combo … or self.is_recording`) would have been dead code that *creates* the leak it
+fears, by moving the `add` above the `return`.

@@ -81,6 +81,22 @@ class TextInjector:
 
             return self._paste(text)
 
+    def stage(self, text: str) -> bool:
+        """Put text on the clipboard and send no keys at all.
+
+        This is what makes a refusal survivable: when we decide *not* to paste
+        (focus moved, selection vanished) the words are still one Ctrl+V away,
+        so refusing is not the same as losing the dictation.
+        """
+        if not text:
+            return False
+        try:
+            pyperclip.copy(text)
+            return True
+        except Exception as e:
+            logger.error("Clipboard stage failed: %s", e)
+            return False
+
     def _type_directly(self, text: str) -> bool:
         try:
             self._kb.type(text)
