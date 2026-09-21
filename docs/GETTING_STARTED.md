@@ -32,14 +32,16 @@ filler removal, self-corrections, punctuation)
 2. Copy the key from the dashboard home page
 3. Paste it into the app → **Save** (it is verified against your account)
 
-**Groq** (optional — only if you want **Command Mode**, the
-select-text-and-edit-by-voice feature)
+**Groq** (optional — two bonus features)
 
 1. Get a free key at [console.groq.com/keys](https://console.groq.com/keys)
 2. Paste it → **Save**
 
-No Groq key? Dictation works at full quality — Command Mode simply stays
-off.
+With a Groq key you get **smart formatting** (the Dictation API cleans;
+Groq then adds paragraphs, bullets and numbering — word-for-word
+identical otherwise) and **Command Mode** (select text, edit by voice).
+Without one, dictation still works at full quality — both simply stay
+off. Smart formatting can be toggled in **Settings → Cleanup**.
 
 ## 4. Dictate
 
@@ -170,7 +172,7 @@ Everything is stored locally in `%APPDATA%\WhisprFlow\`:
 
 | File | Contents |
 |---|---|
-| `.env` | Your API keys and tone preference |
+| `.env` | Your API keys, tone and formatting preferences |
 | `user_dictionary.txt` | Your terms |
 | `profiles.json` | Per-app formatting rules |
 | `snippets.json` | Voice-triggered text expansions |
@@ -190,6 +192,7 @@ Toggles you can add to `%APPDATA%\WhisprFlow\.env`:
 
 ```
 WHISPRFLOW_TONE=general      # general | casual | formal
+WHISPRFLOW_FORMAT=1          # smart formatting (needs a Groq key)
 WHISPRFLOW_MIC_DEVICE=       # pin a specific microphone
 WHISPRFLOW_DEBUG=0           # verbose logging
 ```

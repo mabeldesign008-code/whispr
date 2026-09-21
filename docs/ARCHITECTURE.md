@@ -24,6 +24,8 @@ hotkey up
       response: text (verbatim) + llm_response (cleaned)
   → snippets expand verbatim text if a trigger matched
   → choose: server's cleaned text, else deterministic local cleanup
+  → optional layout pass (Groq): paragraphs/bullets/numbering,
+    word-for-word verified, fail-safe (any doubt → Dictation text)
   → anchor check (focus still where the user left it?) → paste
   → visible log line; any degradation is named, never a silent ✓
 ```
@@ -37,6 +39,7 @@ hotkey up
 | `audio/process.py` | VAD + normalisation before upload |
 | `stt/dictation.py` | DictationClient — the only STT path |
 | `refine/refiner.py` | `build_instruction()` per take; `basic_cleanup()` fallback |
+| `refine/formatter.py` | Smart formatting pass (optional, Groq gpt-oss-20b) |
 | `refine/commands.py` | Command Mode (optional, Groq gpt-oss) |
 | `context/profiles.py` | Process-name → one-line formatting instruction |
 | `context/snippets.py` | "my email" → canned text, pure local |
@@ -73,6 +76,19 @@ then appends:
 Only takes longer than ~4 s get an instruction — the docs note the
 rewrite is blunt on tiny fragments, so those use `text` with the local
 cleanup instead.
+
+## Smart formatting (the layout pass)
+
+The Dictation API cleans but does not lay out: long takes come back as
+one flat block. The formatter adds paragraphs at topic shifts, `- `
+bullets for parallel items, and `1.` numbering for spoken enumerations —
+and **zero words**. Its acceptance test is deterministic: strip list
+markers and whitespace from input and output; the word streams must be
+identical, or the Dictation text is used instead. There is no heuristic
+guard, so there is no false-rejection rate to regret (AUDIT_REPORT §3 is
+the history that taught this). Skipped for Code/Terminal profiles
+(`allow_format=False`), for takes under ~15 words, when a snippet fired,
+and on any degraded (fallback/verbatim) take.
 
 ## Degradation contract
 

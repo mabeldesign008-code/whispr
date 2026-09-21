@@ -30,6 +30,9 @@ class Profile:
     name: str
     instruction: str
     processes: List[str] = field(default_factory=list)
+    # Smart formatting (paragraphs/bullets via Groq) is wrong for code and
+    # shell commands -- line breaks change meaning there.
+    allow_format: bool = True
 
     def matches(self, process: str) -> bool:
         p = (process or "").lower()
@@ -50,6 +53,7 @@ CODE = Profile(
         "identifiers. Spoken punctuation like 'dot', 'underscore', 'dash' "
         "inside an identifier should become the symbol."
     ),
+    allow_format=False,
 )
 
 TERMINAL = Profile(
@@ -61,6 +65,7 @@ TERMINAL = Profile(
         "no trailing full stop, no capitalisation of the command, and no "
         "explanation. Preserve flags and paths exactly."
     ),
+    allow_format=False,
 )
 
 CHAT = Profile(
@@ -145,6 +150,7 @@ class ProfileSet:
                     name=entry["name"],
                     instruction=entry.get("instruction", ""),
                     processes=[s.lower() for s in entry.get("processes", [])],
+                    allow_format=bool(entry.get("allow_format", True)),
                 )
             except Exception:
                 continue

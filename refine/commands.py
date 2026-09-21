@@ -46,8 +46,9 @@ FALLBACK_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
 
 #: Error strings that mean "this model id no longer exists on Groq" —
 #: try the next candidate instead of failing the command.
-DEAD_MODEL_MARKERS = ("model_decommissioned", "no longer supported",
-                      "does not exist", "model_not_found", "unknown model")
+DEAD_MODEL_MARKERS = ("decommissioned", "model_decommissioned",
+                      "no longer supported", "does not exist",
+                      "model_not_found", "unknown model")
 
 
 def error_detail(resp: "httpx.Response") -> str:

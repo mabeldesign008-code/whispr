@@ -34,6 +34,7 @@ from context import ProfileSet, SnippetSet
 from injector import TextInjector
 from refine import TONE_NAMES, basic_cleanup, build_instruction, default_tone
 from refine.commands import CommandProcessor
+from refine.formatter import Formatter
 from selection import SelectionManager
 from stt import DictationClient, UserDictionary, default_config_dir
 from ui import theme
@@ -203,6 +204,10 @@ class WhisprFlowApp:
         # it stays optional (needs a Groq key) because the Dictation API has
         # no transform-on-selection endpoint.
         self.commands = CommandProcessor(api_key=os.getenv("GROQ_API_KEY", ""))
+        # Smart formatting: the Dictation API cleans, Groq LAYS OUT
+        # (paragraphs, bullets, numbering) under a word-for-word verifier.
+        # Optional; without a key the Dictation text is injected as-is.
+        self.formatter = Formatter(api_key=os.getenv("GROQ_API_KEY", ""))
         self.selection = SelectionManager()
 
         # One client, one request per take: verbatim + cleaned text come
@@ -226,6 +231,7 @@ class WhisprFlowApp:
         self.snippets.write_template()
 
         self._profile_instruction = ""
+        self._profile_allow_format = True
         self._live_process = ""
 
         self._state_lock = threading.RLock()
@@ -289,6 +295,8 @@ class WhisprFlowApp:
         # pipeline reads this plain mirror instead of the BooleanVar.
         self._cleanup_on = True
         self.cleanup_enabled = tk.BooleanVar(value=True)
+        self._format_on = _flag("WHISPRFLOW_FORMAT", True)
+        self.formatting_enabled = tk.BooleanVar(value=self._format_on)
 
         self._build_ui()
         self.pill = FloatingPill(
@@ -365,11 +373,12 @@ class WhisprFlowApp:
         self.aai_entry = self._key_row(card, "AssemblyAI API key",
                                        os.getenv("ASSEMBLYAI_API_KEY", ""),
                                        self.save_assemblyai_key)
-        Label(card, text="One key powers everything below. Groq is only "
-                         "needed if you use Command Mode.",
-              font=(theme.UI_FONT, 9), fg=theme.HEX_MUTED,
+        Label(card, text="AssemblyAI transcribes and cleans. Groq adds smart "
+                         "formatting (paragraphs, bullets) and Command Mode.",
+              font=(theme.UI_FONT, 9), fg=theme.HEX_MUTED, wraplength=280,
+              justify="left",
               bg=theme.HEX_BG_CARD).pack(anchor="w", pady=(0, 4))
-        self.groq_entry = self._key_row(card, "Groq API key (Command Mode only)",
+        self.groq_entry = self._key_row(card, "Groq API key (formatting + Command Mode)",
                                         os.getenv("GROQ_API_KEY", ""),
                                         self.save_groq_key)
 
@@ -449,6 +458,15 @@ class WhisprFlowApp:
             activebackground=theme.HEX_BG_HOVER, activeforeground=theme.HEX_TEXT,
             relief="flat", borderwidth=1, font=(theme.UI_FONT, 9))
         self.tone_menu.pack(side="left")
+
+        tk.Checkbutton(
+            card2, text="Smart formatting (paragraphs, bullets, numbering)",
+            variable=self.formatting_enabled, command=self._on_format_toggle,
+            bg=theme.HEX_BG_CARD, fg=theme.HEX_TEXT,
+            selectcolor=theme.HEX_BG_INPUT, activebackground=theme.HEX_BG_CARD,
+            activeforeground=theme.HEX_TEXT, font=(theme.UI_FONT, 10),
+            borderwidth=0, highlightthickness=0,
+        ).pack(anchor="w", pady=(6, 0))
 
         self.refine_status = Label(card2, text="", font=(theme.UI_FONT, 9),
                                    fg=theme.HEX_MUTED, bg=theme.HEX_BG_CARD)
@@ -656,7 +674,8 @@ class WhisprFlowApp:
             return
         self._persist("GROQ_API_KEY", key)
         self.commands.set_api_key(key)
-        self.log("Groq key saved (Command Mode).", "ok")
+        self.formatter.set_api_key(key)
+        self.log("Groq key saved (formatting + Command Mode).", "ok")
         self._refresh_status()
 
     def add_dictionary_term(self):
@@ -697,6 +716,13 @@ class WhisprFlowApp:
         self._cleanup_on = bool(self.cleanup_enabled.get())
         self.log("Cleanup " + ("enabled." if self.cleanup_enabled.get()
                                  else "disabled — verbatim transcript only."))
+        self._refresh_status()
+
+    def _on_format_toggle(self):
+        self._format_on = bool(self.formatting_enabled.get())
+        self._persist("WHISPRFLOW_FORMAT", "1" if self._format_on else "0")
+        self.log("Smart formatting " + ("enabled (Groq)." if self._format_on
+                                         else "disabled."))
         self._refresh_status()
 
     def _on_tone_selected(self, label):
@@ -758,6 +784,18 @@ class WhisprFlowApp:
                 txt, col = f"Local cleanup: {info['last_error']}", theme.HEX_WARNING
             else:
                 txt, col = f"On · tone: {TONE_NAMES[self.tone]}", theme.HEX_SUCCESS
+
+            if self._format_on:
+                fs = self.formatter.get_stats()
+                if not fs["configured"]:
+                    txt += "  |  formatting: no Groq key"
+                else:
+                    ftxt = f"  |  formatting: {fs['changed']}/{fs['calls']} takes"
+                    if fs["last_error"]:
+                        ftxt += f" ({fs['last_error']})"
+                        if col != theme.HEX_WARNING:
+                            col = theme.HEX_WARNING
+                    txt += ftxt
         self.refine_status.config(text=txt, fg=col, wraplength=280)
         self.dict_label.config(text=f"{len(self.dictionary)} terms")
         self.snippet_label.config(text=f"{len(self.snippets)} triggers")
@@ -1004,6 +1042,7 @@ class WhisprFlowApp:
         self._live_process = process or ""
         profile = self.profiles.resolve(self._live_process)
         self._profile_instruction = profile.instruction if profile else ""
+        self._profile_allow_format = bool(profile.allow_format) if profile else True
         if DEBUG and profile and profile.name != "Default":
             self.log(f"[profile: {profile.name}]")
 
@@ -1238,6 +1277,7 @@ class WhisprFlowApp:
                          f"conf={result.confidence:.2f} kind={result.kind}] {raw}")
 
             final = self._choose_final(raw, result, snippets_used=bool(used))
+            final = await self._maybe_format(final, result, bool(used))
             if self._stale(gen):
                 return
 
@@ -1276,6 +1316,31 @@ class WhisprFlowApp:
             self.log("Server cleanup failed (%s) — applied local cleanup."
                      % (result.llm_error or "error"), "warn")
         return basic_cleanup(raw)
+
+    async def _maybe_format(self, text: str, result, snippets_used: bool) -> str:
+        """Optional Groq layout pass: paragraphs, bullets, numbering.
+
+        Only runs on takes the Dictation API already cleaned ("enhanced"):
+        it formats FINISHED text, it must never paper over a degraded one.
+        Skipped for code/terminal profiles (line breaks change meaning
+        there) and when a snippet fired (the expansion is intentional).
+        The formatter itself is fail-safe: any error or any word change
+        returns the input, so this call can only improve or keep the text.
+        """
+        if not (self._cleanup_on and self._format_on
+                and result.kind == "enhanced" and not snippets_used
+                and self._profile_allow_format
+                and self.formatter.is_configured):
+            return text
+
+        out = await self.formatter.apply(text)
+        if not out.ok:
+            self.log(f"Formatting skipped ({out.error}).", "dim")
+            return out.text
+        if out.changed:
+            self.log(f"Formatted: paragraphs/lists applied "
+                     f"({out.latency_ms} ms).", "dim")
+        return out.text
 
     async def _anchor_ok(self, text: str, require_selection: str = "") -> bool:
         """Is it still safe to write, and if not, salvage the text?
@@ -1377,6 +1442,7 @@ class WhisprFlowApp:
             return
         raw, used = self.snippets.expand(result.text)
         final = self._choose_final(raw, result, snippets_used=bool(used))
+        final = await self._maybe_format(final, result, bool(used))
         if self._stale(gen):
             return
         # The old retry bypassed the focus anchor (audit M-list): same
@@ -1615,7 +1681,7 @@ class WhisprFlowApp:
         except Exception:
             pass
         self.capture.stop_stream()
-        for coro in (self.stt.close(), self.commands.close()):
+        for coro in (self.stt.close(), self.commands.close(), self.formatter.close()):
             try:
                 asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout=3)
             except Exception:

@@ -46,7 +46,10 @@ always-on mic (500 ms pre-roll) → VAD
       └─ llm_response = cleaned text (filler gone, self-corrections
                         resolved, punctuation applied) shaped by your
                         tone + per-app profile
-   → paste at cursor   (visible warning if cleanup had to fall back)
+   → optional smart formatting (Groq): paragraphs, bullets, numbering —
+     layout only, verified word-for-word against the Dictation text,
+     skipped silently for code/terminal profiles
+   → paste at cursor   (visible warning if a step had to fall back)
 ```
 
 One API call returns both versions of the take: the verbatim transcript
@@ -61,6 +64,7 @@ server-side rewrite fails.
 | Capture | Always-on 16 kHz stream + pre-roll ring (`audio/`) |
 | Transcription + cleanup | **AssemblyAI Dictation API** (`stt/dictation.py`) |
 | Tone | General / Casual / Formal → one `llm_instruction` per take (`refine/`) |
+| Smart formatting | Layout pass — paragraphs, bullets, numbering (`refine/formatter.py`, Groq, optional) |
 | Profiles | Per-app formatting: code, terminal, chat, email, docs (`context/profiles.py`) |
 | Command Mode | Select text, speak an instruction, rewritten in place (optional, Groq) |
 | Snippets | Voice-triggered text expansion, zero latency |
@@ -74,7 +78,8 @@ the app's Settings window:
 | Variable | What it does |
 |---|---|
 | `ASSEMBLYAI_API_KEY` | **Required.** Powers transcription and cleanup. |
-| `GROQ_API_KEY` | Optional. Only enables Command Mode (Ctrl+Shift+Win). |
+| `GROQ_API_KEY` | Optional. Enables smart formatting and Command Mode (Ctrl+Shift+Win). |
+| `WHISPRFLOW_FORMAT` | `1` (default) enables smart formatting when a Groq key is present. |
 | `WHISPRFLOW_TONE` | `general` (default), `casual` or `formal`. |
 | `WHISPRFLOW_MIC_DEVICE` | Pin a specific microphone. |
 
@@ -138,6 +143,8 @@ Windows GitHub runner (`.github/workflows/release.yml`).
 
 ## Known limitations
 
+- Groq formatting adds ~0.5 s to longer takes; disable it in Settings
+  (Smart formatting) if you'd rather have raw speed.
 - No live partials: the Dictation API is request/response, so the pill
   shows a waveform while you speak and the finished text follows ~0.3–1 s
   after release.
