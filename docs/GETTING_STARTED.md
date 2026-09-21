@@ -24,20 +24,22 @@ reproducible from source — see [Build it yourself](#build-it-yourself).
 
 The settings window opens on first launch.
 
-**AssemblyAI** (required — this does the transcription)
+**AssemblyAI** (required — this does the transcription *and* the cleanup:
+filler removal, self-corrections, punctuation)
 
 1. Sign up at [assemblyai.com](https://www.assemblyai.com/dashboard/signup)
-   — no credit card, **$50 free credit ≈ 185 hours**
+   — no credit card, **$50 free credits** (then $0.62 per hour of audio)
 2. Copy the key from the dashboard home page
-3. Paste it into the app → **Save**
+3. Paste it into the app → **Save** (it is verified against your account)
 
-**Groq** (optional — AI cleanup: punctuation, filler removal, formatting)
+**Groq** (optional — only if you want **Command Mode**, the
+select-text-and-edit-by-voice feature)
 
 1. Get a free key at [console.groq.com/keys](https://console.groq.com/keys)
 2. Paste it → **Save**
 
-Without Groq you still get accurate transcripts, just with basic
-capitalisation instead of AI polish.
+No Groq key? Dictation works at full quality — Command Mode simply stays
+off.
 
 ## 4. Dictate
 
@@ -45,8 +47,9 @@ Put your cursor in any text field — browser, VS Code, Slack, Word.
 
 **Hold `Ctrl + Win`**, speak, release.
 
-A pill appears at the bottom of the screen. Your words show up live while
-you talk, then land at your cursor about half a second after you stop.
+A pill appears at the bottom of the screen with a live waveform while you
+talk; the finished text lands at your cursor about half a second to a
+second after you stop.
 
 | Action | How |
 |---|---|
@@ -114,23 +117,16 @@ No AI involved, so it costs nothing and adds no latency.
 
 ### How long can I speak?
 
-**Up to 30 minutes in one take.** That is roughly 4,500 spoken words.
+**Up to about 1 minute 50 seconds in one take.** The Dictation API
+accepts clips of at most 2 minutes, so the app stops you comfortably
+before that, warns 30 seconds ahead, and transcribes what you have rather
+than losing anything. For anything longer, use hands-free mode in
+segments — each take pastes where the cursor is, so continuing is just
+tapping the hotkey again.
 
-The limit is local memory, not the service — audio is buffered in RAM at
-about 3.8 MB per minute, so 30 minutes is ~115 MB. You will get a warning
-in the activity log 30 seconds before the cap, and the app stops and
-transcribes automatically rather than losing anything.
-
-For reference, everything else in the chain is far more generous:
-
-| Limit | Value |
-|---|---|
-| WhisprFlow buffer | 30 min |
-| AssemblyAI streaming session | 3 hours |
-| AssemblyAI upload | 10 hours / 2.2 GB |
-
-Cost is about **$0.10 per hour** of audio, so the free $50 credit covers
-roughly 185 hours.
+**Cost:** the Dictation API is **$0.62 per hour of audio**, billed per
+second, so ~80 hours of actual speech fits in the free $50 credits — for
+most people that is months of dictation.
 
 The app lives in your system tray. Closing the window hides it; quit from
 the tray menu.
@@ -152,9 +148,6 @@ mabeldesign
 ```
 
 These go straight to the recogniser as keyterms, so it stops guessing.
-The app also **suggests terms automatically**: if an unusual word keeps
-coming up, it appears under *Suggested* with an **Add** button. Nothing is
-added without your approval.
 
 ## Per-app formatting
 
@@ -177,32 +170,28 @@ Everything is stored locally in `%APPDATA%\WhisprFlow\`:
 
 | File | Contents |
 |---|---|
-| `.env` | Your API keys |
+| `.env` | Your API keys and tone preference |
 | `user_dictionary.txt` | Your terms |
 | `profiles.json` | Per-app formatting rules |
-| `learned.json` | Auto-learn candidates |
+| `snippets.json` | Voice-triggered text expansions |
 
-**What leaves your machine:** the audio you dictate goes to AssemblyAI;
-the resulting text goes to Groq if refinement is on. Nothing else.
+**What leaves your machine:** each take's audio goes to AssemblyAI, which
+returns both the verbatim transcript and the cleaned text in the same
+response. Nothing else leaves for dictation. (Command Mode, if you add a
+Groq key and use it, sends the *selected text* plus your spoken
+instruction to Groq.)
 
-The app reads your **foreground window's name and title** to pick a
-formatting profile. It does **not** screenshot your screen, and it does
-**not** log your keystrokes. Reading the focused text field's existing
-content is off by default.
+The app reads your **foreground window's process name** (e.g.
+`chrome.exe`) to pick a formatting profile. It does **not** read your
+window titles, screenshot your screen, read field contents, or log your
+keystrokes.
 
-To disable context entirely, add to `%APPDATA%\WhisprFlow\.env`:
-
-```
-WHISPRFLOW_CONTEXT=0
-```
-
-Other toggles:
+Toggles you can add to `%APPDATA%\WhisprFlow\.env`:
 
 ```
-WHISPRFLOW_STREAMING=1    # live text while you speak
-WHISPRFLOW_AUTOLEARN=1    # suggest dictionary terms
-WHISPRFLOW_READ_FIELD=0   # read the focused field's text
-WHISPRFLOW_DEBUG=0        # verbose logging
+WHISPRFLOW_TONE=general      # general | casual | formal
+WHISPRFLOW_MIC_DEVICE=       # pin a specific microphone
+WHISPRFLOW_DEBUG=0           # verbose logging
 ```
 
 ---
@@ -215,9 +204,9 @@ Windows mic permission is off. Check *Settings → Privacy → Microphone*.
 **"Check API key"** — the key was rejected. Re-copy it; keys have no
 spaces and aren't wrapped in quotes.
 
-**"Out of credit"** — the free $50 is used up. Add billing at AssemblyAI,
-or switch to the cheaper model by adding `ASSEMBLYAI_MODEL=universal-2`
-to your `.env`.
+**"Out of credit"** — the free $50 is used up. Add billing in the
+AssemblyAI dashboard (pay-as-you-go, no subscription; the Dictation API
+is $0.62 per hour of audio).
 
 **Nothing pastes** — some apps block synthetic keystrokes. Try running
 WhisprFlow as administrator if the target app is elevated.

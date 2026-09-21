@@ -7,7 +7,7 @@ pynput>=1.7.6,<2.0.0
 
 # httpx[http2] gives connection reuse between dictations.
 # The h2 extra is optional at runtime -- the client detects it and falls
-# back to HTTP/1.1 rather than crashing (see stt/assemblyai_client.py).
+# back to HTTP/1.1 rather than crashing (see stt/dictation.py).
 httpx[http2]>=0.27.0,<0.29.0
 
 # ── Audio ─────────────────────────────────────────────────────────────
@@ -18,18 +18,12 @@ sounddevice>=0.4.6,<0.6.0
 numpy>=1.24.0,<3.0.0
 scipy>=1.11.0,<2.0.0
 
-# Speech recognition is AssemblyAI over plain HTTP via httpx -- no SDK
-# (the official one is synchronous and would block the asyncio loop).
+# Speech recognition + cleanup are the AssemblyAI Dictation API over plain
+# HTTP via httpx -- no SDK (the official one is synchronous and would block
+# the asyncio loop). One POST per take returns verbatim and cleaned text.
 
-# ── Streaming (live partials + ~0.5s tail latency instead of ~2s) ─────
-# Optional: without it the app uses the batch endpoint and simply shows a
-# waveform instead of live text.
-websockets>=12.0,<16.0
-
-# ── App context (foreground window, focused control) ──────────────────
-# Optional: without these, refinement runs without app context.
+# ── App context (foreground window process name for profiles) ─────────
 psutil>=5.9.0; sys_platform == "win32"
-uiautomation>=2.0.18; sys_platform == "win32"
 
 # ── GUI ───────────────────────────────────────────────────────────────
 Pillow>=10.1.0,<12.0.0

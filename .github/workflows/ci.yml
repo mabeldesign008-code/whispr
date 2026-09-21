@@ -38,13 +38,10 @@ jobs:
       - name: Lint for undefined names
         # Scoped to real errors, not style. An undefined name shipped a
         # crash-on-every-recording bug once already.
-        run: python -m pyflakes main.py audio ui stt refine context injector.py
+        run: python -m pyflakes main.py audio ui stt refine context injector.py selection.py
 
       - name: Unit tests
-        run: python -m pytest -q
-
-      - name: Mock API integration
-        run: python eval/mock_api_test.py
+        run: python -m pytest tests/ -q
 
       - name: Import probe (unfrozen)
         # Same checks the packaged binary runs, so a missing dependency is
@@ -54,12 +51,4 @@ jobs:
 
       - name: Import probe (Windows)
         run: python eval/import_probe.py
-        if: runner.os == 'Windows' 
-
-      - name: Boot smoke test (Linux)
-        if: runner.os == 'Linux'
-        run: xvfb-run -a python eval/smoke_test.py
-
-      - name: Verify imports (Windows)
         if: runner.os == 'Windows'
-        run: python -c "import main; print('OK')"

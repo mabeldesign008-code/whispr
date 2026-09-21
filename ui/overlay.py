@@ -122,7 +122,6 @@ class FloatingPill:
         self.state = PillState.IDLE
         self._state_since = time.monotonic()
         self._status_text = ""
-        self._partial_text = ""
         self._locked = False
         self._command_mode = False
 
@@ -180,7 +179,6 @@ class FloatingPill:
             self._command_mode = False
         self._command_mode = False
         if state is PillState.RECORDING:
-            self._partial_text = ""
             for b in self._bars:
                 b.snap(0.0)
 
@@ -201,16 +199,6 @@ class FloatingPill:
         if active == self._command_mode:
             return
         self._command_mode = active
-        self._wake()
-
-    def set_partial(self, text: str) -> None:
-        """Live transcript while the user is still speaking. Shown instead
-        of the waveform once there are words to show -- seeing your words
-        appear is far better feedback than a bouncing equaliser."""
-        text = (text or "").strip()
-        if text == self._partial_text:
-            return
-        self._partial_text = text
         self._wake()
 
     def flash_success(self, message: str = "") -> None:
@@ -407,48 +395,10 @@ class FloatingPill:
 
     def _draw_recording(self, d, bw, bh, S, reveal, dt):
         self._draw_cancel(d, bw, bh, S, reveal)
-        if self._partial_text:
-            self._draw_partial(d, bw, bh, S, reveal)
-        else:
-            self._draw_waveform(d, bw, bh, S, reveal, dt)
+        # No live partials any more: the Dictation API returns the whole
+        # take in one shot, so the mic waveform is the recording feedback.
+        self._draw_waveform(d, bw, bh, S, reveal, dt)
         self._draw_stop(d, bw, bh, S, reveal)
-
-    def _draw_partial(self, d, bw, bh, S, reveal):
-        """Live text, tail-anchored so the newest words stay visible.
-
-        Measured against the space between the cancel and stop buttons and
-        trimmed to fit, so a long transcript can never collide with them.
-        """
-        left = 32 * S           # clear of the cancel button
-        right = bw - (36 if self._locked else 32) * S   # clear of the stop button
-        avail = right - left
-        cy = bh // 2
-
-        def width(s: str) -> float:
-            try:
-                return d.textlength(s, font=self._font_small)
-            except Exception:
-                return len(s) * 5.0 * S
-
-        caret_w = 5 * S
-        text = _tail(self._partial_text, 60)
-        while text and width(text) > avail - caret_w:
-            text = "\u2026" + text[2:]      # drop a char, keep the ellipsis
-
-        if not text:
-            return
-
-        tw = width(text)
-        x = left + (avail - tw - caret_w) / 2
-        d.text((x, cy), text, font=self._font_small,
-               fill=(*TEXT, int(240 * reveal)), anchor="lm")
-
-        # Blinking caret keeps it feeling live even mid-pause.
-        if (time.monotonic() % 1.0) < 0.6:
-            cx = x + tw + 2.5 * S
-            d.line([cx, cy - 5 * S, cx, cy + 5 * S],
-                   fill=(*self._accent(), int(220 * reveal)),
-                   width=max(1, int(1.2 * S)))
 
     def _draw_waveform(self, d, bw, bh, S, reveal, dt):
         level = min(1.0, max(0.0, self._get_level() * 6.0))
@@ -603,12 +553,6 @@ def _load_font(size: int):
 def _lerp_rgb(a, b, t: float):
     t = max(0.0, min(1.0, t))
     return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
-
-
-def _tail(text: str, limit: int) -> str:
-    """Keep the end of a growing transcript, not the start."""
-    text = (text or "").strip()
-    return text if len(text) <= limit else "\u2026" + text[-(limit - 1):]
 
 
 def _truncate(text: str, limit: int) -> str:

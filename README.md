@@ -1,10 +1,12 @@
 # WhisprFlow
 
-System-wide AI dictation for Windows. Hold a hotkey, speak, and polished
+System-wide AI dictation for Windows. Hold a hotkey, speak, and clean
 text appears at your cursor in any application.
 
-> Rebuilt from the ground up — see [`AUDIT.md`](AUDIT.md) for the original
-> engineering audit and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for
+> September 2026: the transcription + cleanup stack was replaced
+> wholesale with the [AssemblyAI Dictation API](https://www.assemblyai.com/docs/dictation)
+> after a full engineering audit — see [`AUDIT_REPORT.md`](AUDIT_REPORT.md)
+> for the findings and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for
 > how it works now.
 
 ---
@@ -15,12 +17,13 @@ text appears at your cursor in any application.
 — one file, no installer, no Python needed.
 
 Run it, paste an [AssemblyAI key](https://www.assemblyai.com/dashboard/signup)
-(free, no card, ~185 hours), then hold **Ctrl + Win** and speak.
-
-Full walkthrough: **[Getting started](docs/GETTING_STARTED.md)**
+(new accounts: **$50 free credits, no card**; thereafter the Dictation API
+is $0.62 per hour of audio), then hold **Ctrl + Win** and speak.
 
 > Windows SmartScreen will warn on first run because the binary is
 > unsigned. **More info → Run anyway**.
+
+Full walkthrough: **[Getting started](docs/GETTING_STARTED.md)**
 
 ### Run from source instead
 
@@ -28,7 +31,7 @@ Full walkthrough: **[Getting started](docs/GETTING_STARTED.md)**
 git clone https://github.com/mabeldesign008-code/flow.git
 cd flow
 pip install -r requirements.txt
-python setup_stt.py
+python setup_stt.py      # stores + verifies your AssemblyAI key
 python main.py
 ```
 
@@ -37,138 +40,109 @@ python main.py
 ## How it works
 
 ```
-always-on mic (500 ms pre-roll) → VAD → AssemblyAI (streaming socket,
-Sync one-shot, or async upload)
-   → Groq + per-app profile → guard → paste → auto-learn
+always-on mic (500 ms pre-roll) → VAD
+   → AssemblyAI Dictation API (one POST)
+      ├─ text         = verbatim transcript
+      └─ llm_response = cleaned text (filler gone, self-corrections
+                        resolved, punctuation applied) shaped by your
+                        tone + per-app profile
+   → paste at cursor   (visible warning if cleanup had to fall back)
 ```
 
-The mic is open before you press the key, so the first syllable is never
-lost. Every LLM rewrite is checked before injection.
-
-The guard rejects any rewrite that flips a negation, changes a number, or
-drops a dictionary term — the raw transcript is used instead. See
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+One API call returns both versions of the take: the verbatim transcript
+and the cleaned one. There is no second model, no local LLM, no guard —
+the audit found that pipeline silently degrading on essentially every
+take (see `AUDIT_REPORT.md` §2–§4). Now the cleanup is a first-class part
+of the transcription request, with a deterministic local fallback if the
+server-side rewrite fails.
 
 | Stage | Component |
 |---|---|
 | Capture | Always-on 16 kHz stream + pre-roll ring (`audio/`) |
-| Transcription | **AssemblyAI** — Sync one-shot for ≤120 s, streaming partials, async fallback |
-| Context | Foreground app via UI Automation (~5 ms) |
-| Profiles | Per-app formatting: code, terminal, chat, email, docs |
-| Command Mode | Select text, speak an instruction, rewritten in place |
+| Transcription + cleanup | **AssemblyAI Dictation API** (`stt/dictation.py`) |
+| Tone | General / Casual / Formal → one `llm_instruction` per take (`refine/`) |
+| Profiles | Per-app formatting: code, terminal, chat, email, docs (`context/profiles.py`) |
+| Command Mode | Select text, speak an instruction, rewritten in place (optional, Groq) |
 | Snippets | Voice-triggered text expansion, zero latency |
-| Dictionary | `%APPDATA%\WhisprFlow\user_dictionary.txt`, auto-learning |
-| Refinement | Groq `openai/gpt-oss-20b` (fallback chain), output verified by a guard |
-| Injection | Direct unicode ≤120 chars, else clipboard w/ restore |
-
-Architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-
----
+| Dictionary | `%APPDATA%\WhisprFlow\user_dictionary.txt` → bias words |
 
 ## Configuration
 
-`.env` in the project root:
+All settings live in `.env` next to the executable and are editable in
+the app's Settings window:
 
-```
-ASSEMBLYAI_API_KEY=...      # required for cloud accuracy
-GROQ_API_KEY=...            # optional, for LLM refinement
-ASSEMBLYAI_MODEL=universal-3-5-pro
-
-WHISPRFLOW_STREAMING=1      # live partials (default on)
-WHISPRFLOW_CONTEXT=1        # read foreground app (default on)
-WHISPRFLOW_READ_FIELD=0     # read focused field's text (default OFF)
-WHISPRFLOW_AUTOLEARN=1      # suggest dictionary terms (default on)
-
-WHISPRFLOW_SYNC_STT=1       # one-request transcription for <=120 s (default on)
-ASSEMBLYAI_SYNC_URL=https://sync.assemblyai.com   # or sync.us / sync.eu (data zone)
-WHISPRFLOW_SYNC_LIVE_UPLOAD=0  # upload while you talk (see docs/sync-live-upload.md)
-GROQ_REFINE_MODEL=openai/gpt-oss-20b     # refinement model id override
-GROQ_COMMAND_MODEL=openai/gpt-oss-120b   # command-mode model id override
-```
-
-Keys can also be set in the UI (system tray → Transcription History).
+| Variable | What it does |
+|---|---|
+| `ASSEMBLYAI_API_KEY` | **Required.** Powers transcription and cleanup. |
+| `GROQ_API_KEY` | Optional. Only enables Command Mode (Ctrl+Shift+Win). |
+| `WHISPRFLOW_TONE` | `general` (default), `casual` or `formal`. |
+| `WHISPRFLOW_MIC_DEVICE` | Pin a specific microphone. |
 
 ### Custom dictionary
 
-Add your names, jargon, acronyms and product names to
-`%APPDATA%\WhisprFlow\user_dictionary.txt` — one per line. This is the
-single biggest accuracy improvement available.
+Add names and jargon to `%APPDATA%\WhisprFlow\user_dictionary.txt`
+(one per line). They are sent with every take as `keyterms_prompt` so the
+transcriber recognises them.
+
+### Per-app profiles
+
+`%APPDATA%\WhisprFlow\profiles.json` maps a foreground process
+(`code.exe`, `chrome.exe`…) to a one-line formatting instruction. The
+line rides inside the cleanup instruction for that take: dictating into
+VS Code keeps identifiers literally; dictating into Mail gets complete
+sentences.
 
 ## Hotkeys
 
-| Key | Action |
+| Keys | Action |
 |---|---|
-| `Ctrl + Win` (hold) | Dictate, stops when you let go |
-| `Ctrl + Shift + Win` | **Command Mode** — rewrite selected text by voice |
-| `Ctrl + Win` (tap) | Lock recording on — tap again to finish |
-| `Esc` | Cancel a locked recording |
-| `Ctrl + Alt + Z` | Undo |
-
-Tap for hands-free dictation up to **30 minutes**; hold for a quick
-sentence.
-
-Click the left of the pill to cancel mid-recording, the right to stop
-early, or the pill itself after an error to retry.
-
----
+| Hold **Ctrl + Win** | Dictate; release to paste |
+| Tap **Ctrl + Win** | Hands-free dictation; tap again to finish, **Esc** to cancel |
+| **Ctrl + Shift + Win** | Command Mode: transform the current selection by voice (needs Groq key) |
+| **Ctrl + Alt + Z** | Undo the last injection |
 
 ## Development
 
 ```bash
-python -m pytest -q                    # 133 unit tests
-python eval/smoke_test.py              # boots the real app end-to-end
-python eval/mock_api_test.py           # end-to-end HTTP flow
-python eval/run_wer.py                 # accuracy on your own clips
+pip install -r requirements.txt
+python -m pytest tests/ -q
+python -m pyflakes main.py audio ui stt refine context injector.py selection.py
+python eval/import_probe.py
 ```
+
+CI runs all three on Ubuntu and Windows runners.
 
 ### Layout
 
 ```
-main.py                   app, settings window, tray, pipeline
-audio/
-  capture.py              always-on stream + pre-roll ring
-  process.py              VAD, high-pass, RMS levelling
-ui/
-  overlay.py              floating pill
-  theme.py                design tokens
-context/
-  app_context.py          foreground app via UI Automation
-  profiles.py             per-app formatting rules
-  learner.py              auto-learn dictionary terms
-injector.py               text insertion
-stt/
-  base.py                 TranscriptionResult + WAV encoding
-  assemblyai_client.py    transcription engine
-  streaming.py            live partials over WebSocket
-  dictionary.py           user dictionary
-refine/
-  refiner.py              Groq LLM cleanup
-  guard.py                hallucination rejection
-eval/
-  run_wer.py              accuracy harness
-  mock_api_test.py        integration test
+main.py               app wiring: hotkeys, pipeline, settings window
+audio/                always-on capture, VAD, noise floor
+stt/dictation.py      Dictation API client (the only STT path)
+refine/refiner.py     per-take cleanup instruction + local fallback cleanup
+refine/commands.py    Command Mode (optional, Groq)
+context/profiles.py   per-app formatting profiles
+context/snippets.py   voice-triggered text expansion
+injector.py           paste-at-cursor with focus anchoring
+ui/overlay.py         the floating pill
 ```
-
----
 
 ## Requirements
 
-Windows 10/11, a microphone, and an internet connection. The prebuilt EXE
-needs nothing else; running from source needs Python 3.9+.
+Windows 10/11, a microphone, and an AssemblyAI API key.
 
 ## Building the EXE
 
-```bash
-pip install pyinstaller
-pyinstaller WhisprFlow.spec --noconfirm --clean
-```
-
-Releases are built automatically on a Windows runner by
-`.github/workflows/release.yml` — push a `v*` tag or run the workflow
-manually.
+See **[BUILD_EXE.md](BUILD_EXE.md)** — one `pyinstaller` command produces
+a single-file `WhisprFlow.exe`; tagged pushes build it automatically on a
+Windows GitHub runner (`.github/workflows/release.yml`).
 
 ## Known limitations
 
-Windows-only (`winsound`, `ctypes.windll`). Requires an internet
-connection — there is no offline mode. Screen-context OCR was removed; app
-context via UI Automation is the planned replacement (`AUDIT.md` §3.4).
+- No live partials: the Dictation API is request/response, so the pill
+  shows a waveform while you speak and the finished text follows ~0.3–1 s
+  after release.
+- Clips are capped at 2 minutes per take (API limit; the app stops you at
+  90 s of recording by default).
+- Cleanup on clips under ~4 s is done by the deterministic local cleanup,
+  per AssemblyAI's guidance — the server rewrite is blunt on tiny
+  fragments.

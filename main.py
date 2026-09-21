@@ -17,7 +17,6 @@ import winsound
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import tkinter as tk
 from tkinter import Label, messagebox, scrolledtext
@@ -29,16 +28,12 @@ from pynput import keyboard
 from pynput.keyboard import Controller as KeyboardController
 
 from audio import AudioCapture, process as process_audio
-from context import AppContextReader, DictionaryLearner, ProfileSet, SnippetSet
+from context import ProfileSet, SnippetSet
 from injector import TextInjector
-from refine import Refiner, basic_cleanup
-from refine.api_health import health
+from refine import TONE_NAMES, basic_cleanup, build_instruction, default_tone
 from refine.commands import CommandProcessor
 from selection import SelectionManager
-from stt import (
-    AssemblyAIClient, StreamingSession, UserDictionary,
-    default_config_dir, websockets_available,
-)
+from stt import DictationClient, UserDictionary, default_config_dir
 from ui import theme
 from ui.overlay import FloatingPill, PillState
 
@@ -179,17 +174,39 @@ def _foreground_is_ours(sig) -> bool:
     return bool(sig[2]) and sig[2] == os.getpid()
 
 
+def _foreground_process() -> str:
+    """Process name of the foreground window, e.g. "chrome.exe" ("" on
+    non-Windows or any failure). Used only to match formatting profiles.
+    psutil was already a dependency for the deleted UIA reader; the one
+    syscall is ~1 ms and never fails loudly enough to break a take.
+    """
+    if sys.platform != "win32":
+        return ""
+    try:
+        import psutil
+
+        pid = _focus_signature()[2]
+        if not pid or pid == os.getpid():
+            return ""
+        return (psutil.Process(pid).name() or "").lower()
+    except Exception:
+        return ""
+
+
 class WhisprFlowApp:
     def __init__(self):
         self.dictionary = UserDictionary()
         self.injector = TextInjector()
-        self.refiner = Refiner(api_key=os.getenv("GROQ_API_KEY", ""))
+        # Command Mode is the one feature that still calls an LLM directly;
+        # it stays optional (needs a Groq key) because the Dictation API has
+        # no transform-on-selection endpoint.
         self.commands = CommandProcessor(api_key=os.getenv("GROQ_API_KEY", ""))
         self.selection = SelectionManager()
-        self.stt = AssemblyAIClient(
-            api_key=os.getenv("ASSEMBLYAI_API_KEY", ""),
-            model=os.getenv("ASSEMBLYAI_MODEL", "universal-3-5-pro"),
-        )
+
+        # One client, one request per take: verbatim + cleaned text come
+        # back together. This replaced the old streaming/batch STT + Groq
+        # refiner + guard stack (see AUDIT_REPORT.md section 5).
+        self.stt = DictationClient(api_key=os.getenv("ASSEMBLYAI_API_KEY", ""))
 
         # Always-on capture. The stream opens once and stays open, so the
         # pre-roll ring already holds the moment before the hotkey fired.
@@ -199,26 +216,15 @@ class WhisprFlowApp:
         self._device_map = {}
         self._meter_running = False
 
-        # Context: what app the user is in, how text should be formatted
-        # there, and which words keep coming up.
-        self.app_context = AppContextReader(
-            enabled=_flag("WHISPRFLOW_CONTEXT", True),
-            read_surrounding=_flag("WHISPRFLOW_READ_FIELD", False),
-        )
+        # Context: which app the user is dictating into, hence how the
+        # text should be formatted there (Code, Terminal, Chat, Email...).
         self.profiles = ProfileSet(CONFIG_DIR / "profiles.json")
         self.profiles.write_template()
         self.snippets = SnippetSet(CONFIG_DIR / "snippets.json")
         self.snippets.write_template()
-        self.learner = DictionaryLearner(
-            CONFIG_DIR / "learned.json", self.dictionary,
-            enabled=_flag("WHISPRFLOW_AUTOLEARN", True),
-        )
 
-        # Streaming gives partial text while the user is still talking and
-        # cuts the post-speech wait from ~2s to ~0.5s.
-        self.streaming_enabled = _flag("WHISPRFLOW_STREAMING", True) and websockets_available()
-        self._session: Optional[StreamingSession] = None
-        self._live_context = None
+        self._profile_instruction = ""
+        self._live_process = ""
 
         self._state_lock = threading.RLock()
         self.is_recording = False
@@ -233,14 +239,16 @@ class WhisprFlowApp:
         # whatever is focused at injection time (audit C3).
         self._focus_anchor = (0, 0, 0)
         self._start_time = 0.0
-        self._partial = ""
 
         # Rolling end-to-end latency so the Settings page can say what this
         # machine's round trip actually is instead of claiming "latency low"
         # (audit C3: the status text was hardcoded, which is exactly the kind
         # of reassurance that goes stale without anyone noticing).
         self._latency_ms = deque(maxlen=8)
-        self.api_health = health
+
+        # Cleanup tone for the Dictation API rewrite (persisted in .env;
+        # legacy values like "auto"/"polished" are mapped in default_tone).
+        self.tone = default_tone(os.getenv("WHISPRFLOW_TONE", "general"))
 
         # Hands-free mode. A quick tap of the hotkey locks recording on;
         # holding it is classic push-to-talk. Both gestures use the same
@@ -271,8 +279,8 @@ class WhisprFlowApp:
 
         # Tk variables may only be touched on the main thread, so the
         # pipeline reads this plain mirror instead of the BooleanVar.
-        self._refine_on = True
-        self.refinement_enabled = tk.BooleanVar(value=True)
+        self._cleanup_on = True
+        self.cleanup_enabled = tk.BooleanVar(value=True)
 
         self._build_ui()
         self.pill = FloatingPill(
@@ -349,7 +357,11 @@ class WhisprFlowApp:
         self.aai_entry = self._key_row(card, "AssemblyAI API key",
                                        os.getenv("ASSEMBLYAI_API_KEY", ""),
                                        self.save_assemblyai_key)
-        self.groq_entry = self._key_row(card, "Groq API key (refinement)",
+        Label(card, text="One key powers everything below. Groq is only "
+                         "needed if you use Command Mode.",
+              font=(theme.UI_FONT, 9), fg=theme.HEX_MUTED,
+              bg=theme.HEX_BG_CARD).pack(anchor="w", pady=(0, 4))
+        self.groq_entry = self._key_row(card, "Groq API key (Command Mode only)",
                                         os.getenv("GROQ_API_KEY", ""),
                                         self.save_groq_key)
 
@@ -400,16 +412,36 @@ class WhisprFlowApp:
             highlightthickness=0, relief="flat")
         self.meter_canvas.pack(side="left", fill="x", expand=True)
 
-        # ── Refinement ──
-        card2 = self._card(inner, "Refinement")
+        # ── Cleanup tone ──
+        card2 = self._card(inner, "Cleanup")
         tk.Checkbutton(
-            card2, text="Clean up transcripts with AI",
-            variable=self.refinement_enabled, command=self._on_refine_toggle,
+            card2, text="Clean up transcripts (filler removal, punctuation)",
+            variable=self.cleanup_enabled, command=self._on_cleanup_toggle,
             bg=theme.HEX_BG_CARD, fg=theme.HEX_TEXT,
             selectcolor=theme.HEX_BG_INPUT, activebackground=theme.HEX_BG_CARD,
             activeforeground=theme.HEX_TEXT, font=(theme.UI_FONT, 10),
             borderwidth=0, highlightthickness=0,
         ).pack(anchor="w")
+
+        tone_row = tk.Frame(card2, bg=theme.HEX_BG_CARD)
+        tone_row.pack(fill="x", pady=(8, 2))
+        Label(tone_row, text="Tone", font=(theme.UI_FONT, 9, "bold"),
+              fg=theme.HEX_FAINT, bg=theme.HEX_BG_CARD).pack(side="left", padx=(0, 8))
+        self.tone_var = tk.StringVar(value=TONE_NAMES[self.tone])
+        self.tone_menu = tk.OptionMenu(
+            tone_row, self.tone_var, *TONE_NAMES.values(),
+            command=self._on_tone_selected)
+        self.tone_menu.config(
+            bg=theme.HEX_BG_INPUT, fg=theme.HEX_TEXT,
+            activebackground=theme.HEX_BG_HOVER, activeforeground=theme.HEX_TEXT,
+            relief="flat", highlightthickness=0, borderwidth=0,
+            font=(theme.UI_FONT, 9), padx=10, pady=5, cursor="hand2")
+        self.tone_menu["menu"].config(
+            bg=theme.HEX_BG_CARD, fg=theme.HEX_TEXT,
+            activebackground=theme.HEX_BG_HOVER, activeforeground=theme.HEX_TEXT,
+            relief="flat", borderwidth=1, font=(theme.UI_FONT, 9))
+        self.tone_menu.pack(side="left")
+
         self.refine_status = Label(card2, text="", font=(theme.UI_FONT, 9),
                                    fg=theme.HEX_MUTED, bg=theme.HEX_BG_CARD)
         self.refine_status.pack(anchor="w", pady=(4, 0))
@@ -432,12 +464,6 @@ class WhisprFlowApp:
         self._button(row, "Add", self.add_dictionary_term).pack(side="left", padx=(0, 6))
         self._button(row, "Open file", self.open_dictionary,
                      subtle=True).pack(side="left")
-
-        # Auto-learn suggestions. Surfaced for approval rather than added
-        # silently -- a dictionary that fills itself with garbage is worse
-        # than an empty one.
-        self.suggest_frame = tk.Frame(card3, bg=theme.HEX_BG_CARD)
-        self.suggest_frame.pack(fill="x", pady=(10, 0))
 
         # ── Command Mode ──
         cmd = self._card(inner, "Command Mode")
@@ -467,18 +493,15 @@ class WhisprFlowApp:
 
         # ── Context ──
         card5 = self._card(inner, "Context")
-        ci = self.app_context.get_info()
-        ctx_ok = ci["win32"] and ci["enabled"]
-        Label(card5,
-              text=("Reading foreground app" if ctx_ok else "Unavailable"),
-              font=(theme.UI_FONT, 10),
-              fg=theme.HEX_TEXT if ctx_ok else theme.HEX_MUTED,
+        Label(card5, text="Formatting profiles per app",
+              font=(theme.UI_FONT, 10), fg=theme.HEX_TEXT,
               bg=theme.HEX_BG_CARD).pack(anchor="w")
-        detail = f"{len(self.profiles.profiles)} formatting profiles"
-        if self.streaming_enabled:
-            detail += " \u00b7 streaming on"
-        Label(card5, text=detail, font=(theme.UI_FONT, 9),
-              fg=theme.HEX_MUTED, bg=theme.HEX_BG_CARD).pack(anchor="w", pady=(1, 8))
+        Label(card5,
+              text=(f"{len(self.profiles.profiles)} profiles — the app in "
+                    "focus shapes the cleanup (Code, Terminal, Chat\u2026)"),
+              font=(theme.UI_FONT, 9), fg=theme.HEX_MUTED, wraplength=280,
+              justify="left",
+              bg=theme.HEX_BG_CARD).pack(anchor="w", pady=(1, 8))
         self._button(card5, "Edit profiles", self.open_profiles,
                      subtle=True).pack(anchor="w")
 
@@ -602,8 +625,7 @@ class WhisprFlowApp:
         if ok:
             self.log(f"AssemblyAI key saved. {msg}", "ok")
             self._set_status_text(self.engine_sub, "Key verified \u00b7 " + msg)
-            await self.stt.warmup()
-            await self.stt.warm_sync()
+            await self.stt.warm()
         elif ok is None:
             self.log("AssemblyAI key saved, but it could not be verified offline.", "warn")
             self._set_status_text(self.engine_sub, "Saved \u00b7 not verified: " + msg)
@@ -625,9 +647,8 @@ class WhisprFlowApp:
             messagebox.showwarning("WhisprFlow", "Enter a Groq API key.")
             return
         self._persist("GROQ_API_KEY", key)
-        self.refiner.set_api_key(key)
         self.commands.set_api_key(key)
-        self.log("Groq key saved.", "ok")
+        self.log("Groq key saved (Command Mode).", "ok")
         self._refresh_status()
 
     def add_dictionary_term(self):
@@ -640,45 +661,6 @@ class WhisprFlowApp:
             self._refresh_status()
         else:
             self.log(f"\u201c{term}\u201d not added (duplicate or too long).", "warn")
-
-    def _render_suggestions(self):
-        for child in self.suggest_frame.winfo_children():
-            child.destroy()
-
-        candidates = self.learner.candidates(limit=3)
-        if not candidates:
-            return
-
-        Label(self.suggest_frame, text="SUGGESTED", font=(theme.UI_FONT, 8, "bold"),
-              fg=theme.HEX_FAINT, bg=theme.HEX_BG_CARD).pack(anchor="w", pady=(0, 4))
-
-        for c in candidates:
-            row = tk.Frame(self.suggest_frame, bg=theme.HEX_BG_CARD)
-            row.pack(fill="x", pady=1)
-            Label(row, text=c.term, font=(theme.UI_FONT, 10),
-                  fg=theme.HEX_TEXT, bg=theme.HEX_BG_CARD).pack(side="left")
-            Label(row, text=f"heard {c.count}\u00d7", font=(theme.UI_FONT, 8),
-                  fg=theme.HEX_FAINT, bg=theme.HEX_BG_CARD).pack(side="left", padx=(6, 0))
-            tk.Button(row, text="\u2715", command=lambda t=c.term: self.dismiss_term(t),
-                      bg=theme.HEX_BG_CARD, fg=theme.HEX_FAINT, relief="flat",
-                      font=(theme.UI_FONT, 9), cursor="hand2", borderwidth=0,
-                      activebackground=theme.HEX_BG_CARD,
-                      highlightthickness=0).pack(side="right")
-            tk.Button(row, text="Add", command=lambda t=c.term: self.accept_term(t),
-                      bg=theme.HEX_BG_INPUT, fg=theme.HEX_TEXT, relief="flat",
-                      font=(theme.UI_FONT, 8, "bold"), padx=8, pady=2,
-                      cursor="hand2", borderwidth=0,
-                      activebackground=theme.HEX_BG_HOVER,
-                      highlightthickness=0).pack(side="right", padx=(0, 6))
-
-    def accept_term(self, term: str):
-        if self.learner.accept(term):
-            self.log(f"Learned \u201c{term}\u201d.", "ok")
-        self._refresh_status()
-
-    def dismiss_term(self, term: str):
-        self.learner.dismiss(term)
-        self._refresh_status()
 
     def open_snippets(self):
         try:
@@ -703,11 +685,17 @@ class WhisprFlowApp:
         except Exception as e:
             self.log(f"Could not open dictionary: {e}", "error")
 
-    def _on_refine_toggle(self):
-        self._refine_on = bool(self.refinement_enabled.get())
-        self.log("Refinement " + ("enabled." if self.refinement_enabled.get()
-                                   else "disabled — raw transcript only."))
+    def _on_cleanup_toggle(self):
+        self._cleanup_on = bool(self.cleanup_enabled.get())
+        self.log("Cleanup " + ("enabled." if self.cleanup_enabled.get()
+                                 else "disabled — verbatim transcript only."))
         self._refresh_status()
+
+    def _on_tone_selected(self, label):
+        inv = {v: k for k, v in TONE_NAMES.items()}
+        self.tone = inv.get(label, "general")
+        self._persist("WHISPRFLOW_TONE", self.tone)
+        self.log(f"Cleanup tone: {label}.")
 
     def _refresh_status(self):
         info = self.stt.get_info()
@@ -717,13 +705,13 @@ class WhisprFlowApp:
         if not info["configured"]:
             sub = "Add an API key to start"
         else:
-            # Saying which path served the last takes is the difference
+            # Saying what happened on the last take is the difference
             # between "it feels slow" being diagnosable and not (audit C12).
-            path = ("Sync ≤120 s" if info.get("sync_enabled") else "Async (upload+poll)")
-            if info.get("live_upload"):
-                path += " · live upload"
-            bits = [f"{path} · {info.get('sync_hits', 0)} fast, "
-                    f"{info.get('async_fallbacks', 0)} fell back"]
+            bits = [f"{info.get('requests', 0)} takes"]
+            if info.get("fallbacks"):
+                bits.append(f"{info['fallbacks']} used local cleanup")
+            if info.get("last_request_ms"):
+                bits.append(f"server {info['last_request_ms']:.0f} ms")
             if info.get("last_error"):
                 bits.append(f"last error: {info['last_error']}")
             if info.get("last_session_id"):
@@ -753,27 +741,16 @@ class WhisprFlowApp:
                 self.mic_sub.config(
                     text=f"16 kHz mono · ready · {lat}")
 
-        if not self.refinement_enabled.get():
-            txt, col = "Off — raw transcript", theme.HEX_MUTED
-        elif not self.refiner.is_configured:
-            txt, col = "No Groq key — basic cleanup only", theme.HEX_WARNING
+        if not self.cleanup_enabled.get():
+            txt, col = "Off — verbatim transcript", theme.HEX_MUTED
         else:
-            st = self.refiner.get_stats()
-            # Surfacing the failure is the whole point of the change: before
-            # this, a retired model id or a dead key looked identical to a
-            # working refiner, because every failure path returned cleaned
-            # text (audit C1/C3).
-            used = st.get("model_used") or st["model"]
-            if st["last_api_error"]:
-                txt = f"{used} · NOT refining: {st['last_api_error']}"
-                col = theme.HEX_DANGER
-            elif st["rejections"]:
-                txt = (f"{used} · guard blocked {st['rejections']}/{st['calls']}"
-                       " (raw text kept)")
-                col = theme.HEX_WARNING
+            # If the server rewrite fails, the pipeline degrades to local
+            # cleanup and logs it — silence about degradations was audit C1.
+            if info.get("last_error"):
+                txt, col = f"Local cleanup: {info['last_error']}", theme.HEX_WARNING
             else:
-                txt, col = f"{used} · guarded", theme.HEX_SUCCESS
-            self.refine_status.config(text=txt, fg=col, wraplength=280)
+                txt, col = f"On · tone: {TONE_NAMES[self.tone]}", theme.HEX_SUCCESS
+        self.refine_status.config(text=txt, fg=col, wraplength=280)
         self.dict_label.config(text=f"{len(self.dictionary)} terms")
         self.snippet_label.config(text=f"{len(self.snippets)} triggers")
 
@@ -782,16 +759,11 @@ class WhisprFlowApp:
             self.command_status.config(text="Needs a Groq key", fg=theme.HEX_WARNING)
         elif cs["invocations"]:
             self.command_status.config(
-                text=(f"{cs['invocations']} used \u00b7 {cs['rejections']} rejected "
-                      f"\u00b7 {health.summary()}"),
-                fg=theme.HEX_WARNING if health.failures else theme.HEX_MUTED)
+                text=f"{cs['invocations']} used \u00b7 {cs['rejections']} rejected",
+                fg=theme.HEX_MUTED)
         else:
             self.command_status.config(text=f"Ready ({cs['model']})",
                                        fg=theme.HEX_SUCCESS)
-        try:
-            self._render_suggestions()
-        except Exception:
-            pass
 
     def _populate_mic_menu(self):
         devices = self.capture.list_devices()
@@ -921,9 +893,6 @@ class WhisprFlowApp:
     def pill_error(self, message: str = ""):
         self._ui(self.pill.flash_error, message)
 
-    def pill_partial(self, text: str):
-        self._ui(self.pill.set_partial, text)
-
     def pill_locked(self, locked: bool):
         self._ui(self.pill.set_locked, locked)
 
@@ -968,29 +937,19 @@ class WhisprFlowApp:
             gen = self.generation
 
         self._start_time = time.monotonic()
-        self._partial = ""
         self.capture.begin()
         beep_async(880, 60)
         self.pill_state(PillState.RECORDING)
 
-        # Read the foreground app now, while the user speaks -- never
-        # after, where it would sit on the critical path. Costs ~2-10 ms
-        # via UI Automation, versus 0.3-2 s for the OCR this replaced.
-        threading.Thread(target=self._grab_context, daemon=True).start()
+        # Resolve the formatting profile now — while the user speaks,
+        # never in the 0.5 s after release where it would sit on the
+        # critical path.
+        self._grab_context()
 
-        if self.streaming_enabled and self.stt.is_configured and not self.command_mode:
-            asyncio.run_coroutine_threadsafe(self._open_stream(gen), self.loop)
-        elif self.stt.live_upload_enabled() and not self.command_mode:
-            # No socket, so the take would otherwise sit in the buffer until
-            # release. Live upload sends it as it is recorded instead; the
-            # transcript is usually waiting by the time the key comes up.
-            asyncio.run_coroutine_threadsafe(self._open_live(), self.loop)
-        elif self.stt.sync_available():
-            # The one-shot Sync request reuses whatever the warm-up opened.
-            # /warm is an unauthenticated no-op whose only job is DNS+TCP+TLS
-            # (docs/sync-stt/connection-pre-warming), so doing it while the
-            # user talks removes ~100 ms+ from a distant client's critical path.
-            asyncio.run_coroutine_threadsafe(self.stt.warm_sync(), self.loop)
+        if self.stt.is_configured and not self.command_mode:
+            # Complete DNS/TCP/TLS (+H2) while audio accumulates; by the
+            # time the key comes up the POST starts sending immediately.
+            asyncio.run_coroutine_threadsafe(self.stt.warm(), self.loop)
 
         threading.Thread(target=self._watch_duration, args=(gen,),
                          daemon=True).start()
@@ -1001,7 +960,10 @@ class WhisprFlowApp:
         A locked recording the user forgets about would otherwise keep
         going until the ring silently truncated the start of it.
         """
-        limit = self.capture.max_seconds
+        # The Dictation API rejects clips over 120 s (the request fails
+        # after billing nothing), so recording stops ahead of that rather
+        # than at the local memory cap.
+        limit = min(self.capture.max_seconds, 110)
         warned = False
         while True:
             time.sleep(0.5)
@@ -1014,75 +976,38 @@ class WhisprFlowApp:
                 self.log(f"30 seconds left of the {limit / 60:.0f} minute limit.",
                          "warn")
             if elapsed >= limit:
-                self.log(f"Reached the {limit / 60:.0f} minute limit — "
-                         "transcribing what you have.", "warn")
+                self.log("Reached the take limit — transcribing what you have.",
+                         "warn")
                 self.stop_recording()
                 return
 
     def _grab_context(self):
+        """Resolve the app-specific profile for this take (fast, sync).
+
+        The old UI-Automation reader ran un-CoInitialize'd on a fresh
+        thread, threw on most apps, and fed a prompt field that had to be
+        kept field-content-free. The foreground process name is one
+        syscall and is all the profiles ever used.
+        """
         try:
-            self._live_context = self.app_context.capture()
+            process = _foreground_process()
         except Exception:
-            self._live_context = None
+            process = ""
+        self._live_process = process or ""
+        profile = self.profiles.resolve(self._live_process)
+        self._profile_instruction = profile.instruction if profile else ""
+        if DEBUG and profile and profile.name != "Default":
+            self.log(f"[profile: {profile.name}]")
 
-    async def _open_stream(self, gen: int):
-        """Open a streaming socket and pump the mic into it while the user
-        talks. Audio is still buffered locally, so a socket failure costs
-        nothing but the partials."""
-        session = StreamingSession(
-            self.stt.api_key,
-            keyterms=self.dictionary.as_keyterms(),
-            on_partial=self._on_partial,
-            batch_model=self.stt.model,
-        )
-        if not await session.open():
-            logger.debug("streaming unavailable: %s", session.error)
-            return
-        if self._stale(gen):
-            await session.abort()
-            return
-
-        self._session = session
-        sent = 0
-        while not self._stale(gen) and self.is_recording:
-            chunk = self.capture.tail_since(sent)
-            if chunk is not None and len(chunk):
-                session.feed(chunk)
-                self.stt.feed_live(chunk)
-                sent += len(chunk)
-            await asyncio.sleep(0.08)
-
-    async def _open_live(self):
-        """Start the Sync live upload for this take. Best-effort by design:
-        if it does not open, the local buffer is still complete and the
-        one-shot request at stop time works exactly as before."""
-        try:
-            await self.stt.open_live(
-                self.capture.sample_rate,
-                keyterms=self.dictionary.as_keyterms(),
-                prompt=self._sync_prompt(),
-                language_code=self.stt.language_code,
-            )
-        except Exception as e:
-            logger.debug("live upload unavailable: %s", e)
-
-    def _sync_prompt(self) -> str:
-        """A short description of what is being dictated, for the Sync
-        `prompt` field ("describing the conversation"). Context is a strong
-        prior for ASR; keep it factual and never send field *content*."""
-        bits = ["Windows dictation typed into"]
-        ctx = self._live_context
-        if ctx is not None and not ctx.is_empty:
-            bits.append(ctx.as_prompt())
-        else:
-            bits.append("a desktop application")
-        return " ".join(bits)[:1200]
-
-    def _on_partial(self, text: str):
-        if not text or not self.is_recording:
-            return
-        self._partial = text
-        self.pill_partial(text)
+    def _stt_prompt(self) -> str:
+        """A short description of the audio for the Dictation `stt_prompt`
+        field. It REPLACES the managed default prompt, so keep it purely
+        descriptive of the audio -- never instruction-like, never field
+        content."""
+        bits = ["A single speaker dictating into a Windows app"]
+        if self._live_process:
+            bits.append(f"(in {self._live_process})")
+        return " ".join(bits)
 
     def start_command_mode(self):
         """Grab the selection, then record the instruction to apply to it."""
@@ -1111,7 +1036,6 @@ class WhisprFlowApp:
         # keys could be released and nothing would happen -- Command Mode
         # would record until the duration cap.
         self._press_time = time.monotonic()
-        self._partial = ""
         self.capture.begin()
         beep_async(1320, 55)
 
@@ -1133,6 +1057,9 @@ class WhisprFlowApp:
             if self._stale(gen):
                 return
 
+            # Verbatim transcription of the spoken instruction — the command
+            # must be heard exactly, with no cleanup rewrite second-guessing
+            # it (and no llm_instruction sent, so none is run).
             result = await self.stt.transcribe(
                 cleaned.samples, cleaned.sample_rate,
                 keyterms=self.dictionary.as_keyterms())
@@ -1152,11 +1079,10 @@ class WhisprFlowApp:
 
             self.log(f"Command: \u201c{instruction}\u201d")
 
-            ctx = self._live_context
             outcome = await self.commands.apply(
                 selected, instruction,
                 dictionary_terms=self.dictionary.as_keyterms(),
-                app_context=ctx.as_prompt() if ctx else "")
+                app_context=self._live_process)
 
             if self._stale(gen):
                 return
@@ -1203,24 +1129,11 @@ class WhisprFlowApp:
         self.pill_locked(False)
         self.pill_command(False)
 
-        # The socket is ours to close from here on: every early return below
-        # must abort it, or the session stays open (billed on connection
-        # duration, and capped at 3 h) with nobody reading it (audit C2).
-        session, self._session = self._session, None
-        if session is not None:
-            # Ask the server to close the in-flight turn now instead of
-            # waiting for its own silence window -- this frame is what removes
-            # most of the "nothing happens when I let go" delay.
-            asyncio.run_coroutine_threadsafe(
-                session.force_endpoint(), self.loop)
-
         beep_async(660, 60)
         audio = self.capture.end()
         duration = time.monotonic() - self._start_time
 
         if audio is None or duration < 0.25:
-            if session is not None:
-                asyncio.run_coroutine_threadsafe(session.abort(), self.loop)
             self.pill_state(PillState.IDLE)
             self.log("Too short.", "warn")
             return
@@ -1229,13 +1142,11 @@ class WhisprFlowApp:
 
         if was_command:
             selected, self._pending_selection = self._pending_selection, ""
-            if session is not None:
-                asyncio.run_coroutine_threadsafe(session.abort(), self.loop)
             asyncio.run_coroutine_threadsafe(
                 self._run_command(audio, gen, selected), self.loop)
             return
 
-        asyncio.run_coroutine_threadsafe(self._pipeline(audio, gen, session), self.loop)
+        asyncio.run_coroutine_threadsafe(self._pipeline(audio, gen), self.loop)
 
     def cancel_recording(self):
         with self._state_lock:
@@ -1248,10 +1159,6 @@ class WhisprFlowApp:
             self.generation += 1     # invalidates any in-flight pipeline
 
         self.capture.discard()
-        session, self._session = self._session, None
-        if session is not None:
-            asyncio.run_coroutine_threadsafe(session.abort(), self.loop)
-        asyncio.run_coroutine_threadsafe(self.stt.abort_live(), self.loop)
         beep_async(440, 90)
         self.pill_state(PillState.IDLE)
         self.log("Cancelled.", "dim")
@@ -1265,22 +1172,40 @@ class WhisprFlowApp:
     #  Pipeline
     # ══════════════════════════════════════════════════════════════════
 
-    async def _pipeline(self, audio, gen: int, session=None):
+    async def _pipeline(self, audio, gen: int):
         try:
             cleaned = await asyncio.to_thread(process_audio, audio, self.capture.sample_rate)
             if self._stale(gen):
-                if session:
-                    await session.abort()
-                await self.stt.abort_live()
                 return
 
             self.last_audio = (cleaned.samples, cleaned.sample_rate)
 
-            result = await self._transcribe(cleaned, session, gen)
+            # A local silence gate saves a billable round trip; catching
+            # coughs and key bumps here costs nothing.
+            if not cleaned.speech_detected:
+                self.log("No speech detected.", "warn")
+                self.pill_state(PillState.IDLE)
+                return
+
+            # One request: verbatim text AND the cleaned version come back
+            # together. The instruction carries the cleanup rules for this
+            # take (tone + app profile); it is skipped on very short takes
+            # where the server rewrite is blunt anyway.
+            want_cleanup = bool(self._cleanup_on)
+            instruction = ""
+            if want_cleanup:
+                instruction = build_instruction(self.tone, self._profile_instruction)
+
+            result = await self.stt.transcribe(
+                cleaned.samples, cleaned.sample_rate,
+                instruction=instruction,
+                prompt=self._stt_prompt(),
+                keyterms=self.dictionary.as_keyterms(),
+            )
             if self._stale(gen) or result is None:
                 return
 
-            if result.ok and result.latency_ms:
+            if result.latency_ms:
                 self._latency_ms.append(int(result.latency_ms))
 
             if not result.ok:
@@ -1290,25 +1215,21 @@ class WhisprFlowApp:
                 return
 
             raw = result.text
-            expanded, used = self.snippets.expand(raw)
+            raw, used = self.snippets.expand(raw)
             if used:
                 self.log(f"Snippet: {', '.join(used)}")
-                raw = expanded
             self.last_raw_text = raw
 
             if not raw.strip():
-                if not cleaned.speech_detected:
-                    self.log("No speech detected.", "warn")
-                else:
-                    self.log("Nothing transcribed.", "warn")
+                self.log("Nothing transcribed.", "warn")
                 self.pill_state(PillState.IDLE)
                 return
 
             if DEBUG:
-                self.log(f"[{result.model} {result.latency_ms}ms "
-                         f"conf={result.confidence:.2f}] {raw}")
+                self.log(f"[dictation {result.latency_ms}ms "
+                         f"conf={result.confidence:.2f} kind={result.kind}] {raw}")
 
-            final = await self._refine(raw, result)
+            final = self._choose_final(raw, result, snippets_used=bool(used))
             if self._stale(gen):
                 return
 
@@ -1320,10 +1241,6 @@ class WhisprFlowApp:
             self.last_failed = False
             self.log(_preview(final), "ok")
             self.pill_success(_preview(final, 22))
-
-            # Learn from what was said, once the text is safely delivered.
-            self.learner.observe(
-                raw, [w.text for w in result.low_confidence_words()])
             self.refresh_status()
 
         except Exception as e:
@@ -1333,40 +1250,24 @@ class WhisprFlowApp:
             if DEBUG:
                 traceback.print_exc()
 
-    async def _transcribe(self, cleaned, session, gen):
-        """Prefer the streaming result -- the audio is already uploaded, so
-        it returns in ~0.5s instead of ~2s. Fall back to batch if the socket
-        failed or produced nothing. Both paths hit the same model, so this
-        is not a silent downgrade."""
-        if session is not None:
-            try:
-                streamed = await session.close_and_finalise()
-                if streamed.ok and streamed.text.strip():
-                    return streamed
-                logger.debug("stream empty (%s); using batch", streamed.error)
-            except Exception as e:
-                logger.debug("stream finalise failed: %s", e)
+    def _choose_final(self, raw: str, result, snippets_used: bool) -> str:
+        """Decide what gets injected: the server's rewrite when it exists,
+        the deterministic local cleanup otherwise.
 
-        if self._stale(gen):
-            return None
+        Degradations are logged visibly -- the audit showed a quiet ✓ on a
+        degraded take is worse than an honest warning (audit C1/C3).
+        """
+        if not self._cleanup_on:
+            return raw
 
-        if not cleaned.speech_detected and not self._partial:
-            self.log("No speech detected.", "warn")
-            self.pill_state(PillState.IDLE)
-            return None
-
-        live = None
-        if self.stt.has_live():
-            # The upload finished (or didn't) while we were refining frames;
-            # asking now costs one read instead of a whole round trip.
-            live = await self.stt.finish_live()
-
-        return await self.stt.transcribe(
-            cleaned.samples, cleaned.sample_rate,
-            keyterms=self.dictionary.as_keyterms(),
-            prompt=self._sync_prompt(),
-            live=live,
-        )
+        if result.kind == "enhanced" and not snippets_used:
+            return result.clean
+        if result.kind == "fallback":
+            # Server-side rewrite failed (llm_error). Local cleanup is the
+            # floor, and the user hears about it rather than seeing ✓.
+            self.log("Server cleanup failed (%s) — applied local cleanup."
+                     % (result.llm_error or "error"), "warn")
+        return basic_cleanup(raw)
 
     async def _anchor_ok(self, text: str, require_selection: str = "") -> bool:
         """Is it still safe to write, and if not, salvage the text?
@@ -1438,29 +1339,6 @@ class WhisprFlowApp:
         self.last_failed = False
         return True
 
-    async def _refine(self, raw: str, result) -> str:
-        if not (self._refine_on and self.refiner.is_configured):
-            return basic_cleanup(raw)
-
-        ctx = self._live_context
-        profile = self.profiles.resolve(ctx.process if ctx else "")
-
-        final = await self.refiner.refine(
-            raw,
-            uncertain_words=[w.text for w in result.low_confidence_words()],
-            dictionary_terms=self.dictionary.as_keyterms(),
-            app_context=ctx.as_prompt() if ctx else "",
-            profile_instruction=profile.instruction,
-            allow_restructure=profile.allow_restructure,
-        )
-        if DEBUG and profile.name != "Default":
-            self.log(f"[profile: {profile.name}]")
-        if self.refiner.last_rejected:
-            self.log(f"Refinement rejected ({self.refiner.last_rejected}) — kept raw text.",
-                     "warn")
-        self.refresh_status()
-        return final
-
     def retry(self):
         if self.last_audio is None:
             self.log("Nothing to retry.", "dim")
@@ -1474,19 +1352,31 @@ class WhisprFlowApp:
         asyncio.run_coroutine_threadsafe(self._retry_from(samples, sr, gen), self.loop)
 
     async def _retry_from(self, samples, sr, gen):
+        want_cleanup = bool(self._cleanup_on)
+        instruction = ""
+        if want_cleanup:
+            instruction = build_instruction(self.tone, self._profile_instruction)
         result = await self.stt.transcribe(
-            samples, sr, keyterms=self.dictionary.as_keyterms())
+            samples, sr,
+            instruction=instruction,
+            prompt=self._stt_prompt(),
+            keyterms=self.dictionary.as_keyterms())
         if self._stale(gen):
             return
         if not result.ok:
             self.log(f"Retry failed: {result.error}", "error")
             self.pill_error(_short_error(result.error))
             return
-        final = await self._refine(result.text, result)
+        raw, used = self.snippets.expand(result.text)
+        final = self._choose_final(raw, result, snippets_used=bool(used))
         if self._stale(gen):
             return
-        self.last_text_injected = final
-        await asyncio.to_thread(self.injector.inject, final)
+        # The old retry bypassed the focus anchor (audit M-list): same
+        # safety as the normal path.
+        if not await self._anchor_ok(final):
+            return
+        if not await self._inject(final):
+            return
         self.log(_preview(final), "ok")
         self.pill_success(_preview(final, 22))
 
@@ -1642,7 +1532,7 @@ class WhisprFlowApp:
         except Exception:
             pass
         self.capture.stop_stream()
-        for coro in (self.stt.close(), self.refiner.close(), self.commands.close()):
+        for coro in (self.stt.close(), self.commands.close()):
             try:
                 asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout=3)
             except Exception:
@@ -1670,7 +1560,8 @@ class WhisprFlowApp:
         else:
             self.log(f"Microphone failed: {self.capture.last_error}", "error")
 
-        asyncio.run_coroutine_threadsafe(self.stt.warmup(), self.loop)
+        # Pre-warm the TLS session so the first dictation doesn't pay for it.
+        asyncio.run_coroutine_threadsafe(self.stt.warm(), self.loop)
 
         keyboard.Listener(on_press=self.on_press, on_release=self.on_release).start()
         keyboard.GlobalHotKeys({"<ctrl>+<alt>+z": self.undo}).start()

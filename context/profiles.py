@@ -7,8 +7,8 @@ understands you: "dictating an email produces formatted email text;
 dictating code comments produces properly structured comments".
 
 A profile is matched on the foreground process name and contributes one
-extra instruction line to the refinement prompt. It never changes what the
-guard checks -- meaning-preserving rules apply identically everywhere.
+extra instruction line to the refinement prompt. The line lands in the Dictation API's llm_instruction
+(see refine/build_instruction).
 
 Users can override or extend the built-ins by editing
 %APPDATA%/WhisprFlow/profiles.json.
@@ -30,9 +30,6 @@ class Profile:
     name: str
     instruction: str
     processes: List[str] = field(default_factory=list)
-    # Articulate rewrites more aggressively. Off for code and terminals,
-    # where the literal words matter.
-    allow_restructure: bool = False
 
     def matches(self, process: str) -> bool:
         p = (process or "").lower()
@@ -85,7 +82,6 @@ EMAIL = Profile(
         "punctuation. Keep the speaker's tone -- do not add pleasantries, "
         "greetings or sign-offs they did not say."
     ),
-    allow_restructure=True,
 )
 
 DOCUMENT = Profile(
@@ -96,7 +92,6 @@ DOCUMENT = Profile(
         "The user is writing prose in a document. Use complete sentences, "
         "correct punctuation and paragraph-appropriate capitalisation."
     ),
-    allow_restructure=True,
 )
 
 BROWSER = Profile(
@@ -150,7 +145,6 @@ class ProfileSet:
                     name=entry["name"],
                     instruction=entry.get("instruction", ""),
                     processes=[s.lower() for s in entry.get("processes", [])],
-                    allow_restructure=bool(entry.get("allow_restructure", False)),
                 )
             except Exception:
                 continue
@@ -166,15 +160,15 @@ class ProfileSet:
             self.path.write_text(json.dumps({
                 "_comment": (
                     "Custom formatting profiles. A profile matching the "
-                    "foreground process adds one instruction to the AI "
-                    "cleanup step. Names matching a built-in (Code, "
-                    "Terminal, Chat, Email, Document, Browser) replace it."
+                    "foreground process adds one instruction line to the "
+                    "Dictation API cleanup (llm_instruction). Names matching "
+                    "a built-in (Code, Terminal, Chat, Email, Document, "
+                    "Browser) replace it."
                 ),
                 "profiles": [{
                     "name": "Example",
                     "processes": ["myapp.exe"],
                     "instruction": "Write in the style my team uses.",
-                    "allow_restructure": False,
                 }],
             }, indent=2), encoding="utf-8")
         except Exception as e:

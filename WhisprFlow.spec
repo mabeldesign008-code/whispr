@@ -67,22 +67,15 @@ hiddenimports = (
         "pynput.mouse._win32",
         "sounddevice",
         "_sounddevice_data",
-        # HTTP/2 and WebSocket transports are imported lazily.
+        # HTTP/2 transport is imported lazily (negotiated for the Dictation
+        # API connection; falls back to HTTP/1.1 without h2).
         "h2",
         "hpack",
         "hyperframe",
-        "websockets",
-        "websockets.legacy",
-        "websockets.legacy.client",
-        # Optional context providers -- guarded at import, but bundled so
-        # the feature works out of the box.
+        # Foreground-process lookup for formatting profiles.
         "psutil",
-        "uiautomation",
-        "comtypes",
-        "comtypes.stream",
     ]
 )
-hiddenimports += collect_submodules("comtypes")
 
 a = Analysis(
     ["main.py"],

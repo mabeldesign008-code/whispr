@@ -36,18 +36,27 @@ from typing import List, Optional
 
 import httpx
 
-from .api_health import DEAD_MODEL_MARKERS, error_detail, health
-
 API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-#: Groq retired `llama-3.3-70b-versatile` on 2026-08-16, naming
-#: openai/gpt-oss-120b and qwen/qwen3.6-27b as the replacements
-#: (https://console.groq.com/docs/deprecations, fetched 2026-09-13). The
-#: retired id is kept last in the chain for accounts that still resolve it.
+#: gpt-oss reasoning models are Groq's production tier; llama-3.x-versatile
+#: and qwen3.6 were retired in 2026 (console.groq.com/docs/deprecations).
+#: 120b reasons too much for a short transform, so both stay on low effort.
 DEFAULT_MODEL = os.getenv("GROQ_COMMAND_MODEL", "openai/gpt-oss-120b")
-FALLBACK_MODELS = ["openai/gpt-oss-120b", "qwen/qwen3.6-27b",
-                   "openai/gpt-oss-20b", "llama-3.3-70b-versatile"]
-HEALTH_SOURCE = "commands"
+FALLBACK_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+
+#: Error strings that mean "this model id no longer exists on Groq" —
+#: try the next candidate instead of failing the command.
+DEAD_MODEL_MARKERS = ("model_decommissioned", "no longer supported",
+                      "does not exist", "model_not_found", "unknown model")
+
+
+def error_detail(resp: "httpx.Response") -> str:
+    try:
+        data = resp.json()
+        err = data.get("error") or {}
+        return str(err.get("message") or data)[:220]
+    except Exception:
+        return (resp.text or "")[:220]
 
 SYSTEM_PROMPT = """You transform text. The user selected some text and spoke an instruction.
 
@@ -194,31 +203,41 @@ class CommandProcessor:
             )
 
         self.invocations += 1
-        health.note_call(HEALTH_SOURCE)
         try:
             client = await self._get_client()
+            # gpt-oss spec (console.groq.com/docs/reasoning):
+            #  - all instructions in ONE user message; system prompts are
+            #    actively discouraged for this model family;
+            #  - reasoning tokens count against max_completion_tokens —
+            #    the audit found this truncating every short take when the
+            #    budget was small — so effort is pinned to low and the
+            #    budget is generous;
+            #  - temperature 0.5-0.7 recommended; 0.3 keeps transforms
+            #    literal without the reasoning-collapse failure mode.
+            user_msg = (
+                self._system(dictionary_terms, app_context)
+                + f"\n\nSELECTED TEXT:\n{selected_text}"
+                + f"\n\nINSTRUCTION: {self._canonical(instruction)}\n\n"
+                "Output ONLY the transformed selected text."
+            )
             payload = {
-                "messages": [
-                    {"role": "system", "content": self._system(dictionary_terms, app_context)},
-                    # Separate turns: the selection must read as data, not
-                    # as something addressed to the model.
-                    {"role": "user", "content": f"SELECTED TEXT:\n{selected_text}"},
-                    {"role": "user", "content": f"INSTRUCTION: {self._canonical(instruction)}"},
-                ],
-                "temperature": 0.2,
-                "max_tokens": min(max(len(selected_text) // 2, 512), 4096),
+                "messages": [{"role": "user", "content": user_msg}],
+                "temperature": 0.3,
+                "max_completion_tokens": min(max(len(selected_text) // 2, 2048), 8192),
+                "reasoning_effort": "low",
+                "include_reasoning": False,
             }
 
-            for model in health.ordered(HEALTH_SOURCE, self.models):
+            last_error = "unknown error"
+            for model in self.models:
                 payload["model"] = model
                 resp = await client.post(API_URL, json=payload, timeout=self.timeout)
 
                 if resp.status_code != 200:
                     detail = error_detail(resp)
                     if any(k in detail.lower() for k in DEAD_MODEL_MARKERS):
-                        health.mark_dead(HEALTH_SOURCE, model)
-                        continue
-                    health.note_failure(HEALTH_SOURCE, f"HTTP {resp.status_code}: {detail}", http=True)
+                        last_error = f"model {model} retired"
+                        continue  # next candidate on the chain
                     return CommandResult(
                         ok=False,
                         error=f"Groq HTTP {resp.status_code}: {detail}",
@@ -230,13 +249,9 @@ class CommandProcessor:
                 if choice.get("finish_reason") == "length":
                     # A truncated transformation would be injected as if it
                     # were the whole result, silently dropping the end of the
-                    # user's selection.
-                    health.note_failure(HEALTH_SOURCE, "completion truncated (finish_reason=length)")
-                    return CommandResult(
-                        ok=False,
-                        error="Groq stopped early (max_tokens); the result would be truncated.",
-                        instruction=instruction,
-                    )
+                    # user's selection. Try the next model before giving up.
+                    last_error = "completion truncated (finish_reason=length)"
+                    continue
                 raw = (choice.get("message") or {}).get("content") or ""
                 if isinstance(raw, list):  # reasoning/content part lists
                     raw = "".join(str(part.get("text", "")) if isinstance(part, dict) else str(part)
@@ -247,12 +262,10 @@ class CommandProcessor:
                 if problem:
                     self.rejections += 1
                     self.last_rejected = problem
-                    health.note_failure(HEALTH_SOURCE, f"output rejected: {problem}")
                     return CommandResult(ok=False, error=problem, instruction=instruction)
 
                 self.last_rejected = None
                 self.last_model_used = model
-                health.note_success(HEALTH_SOURCE)
                 return CommandResult(
                     text=text,
                     ok=True,
@@ -262,16 +275,14 @@ class CommandProcessor:
 
             return CommandResult(
                 ok=False,
-                error="No Groq model id in the candidate list was usable: "
-                      + ", ".join(self.models),
+                error=(f"No Groq model in the candidate list was usable "
+                       f"({last_error}): " + ", ".join(self.models)),
                 instruction=instruction,
             )
 
         except httpx.TimeoutException:
-            health.note_failure(HEALTH_SOURCE, "timed out", timeout=True)
             return CommandResult(ok=False, error="Timed out.", instruction=instruction)
         except Exception as e:
-            health.note_failure(HEALTH_SOURCE, f"{type(e).__name__}: {e}")
             return CommandResult(
                 ok=False, error=f"{type(e).__name__}: {e}", instruction=instruction
             )
