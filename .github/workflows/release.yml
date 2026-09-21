@@ -122,6 +122,9 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path package | Out-Null
           Copy-Item dist/WhisprFlow.exe package/
+          # The console probe twin: when the windowed exe shows nothing, this
+          # is what the user runs to see why (it prints a module checklist).
+          Copy-Item probe/WhisprFlowProbe.exe package/
           Copy-Item README.md package/
           Copy-Item docs/GETTING_STARTED.md package/ -ErrorAction SilentlyContinue
           Compress-Archive -Path package/* -DestinationPath WhisprFlow-windows.zip -Force
@@ -131,6 +134,7 @@ jobs:
           name: WhisprFlow-windows
           path: |
             dist/WhisprFlow.exe
+            probe/WhisprFlowProbe.exe
             WhisprFlow-windows.zip
           retention-days: 90
 
@@ -144,6 +148,7 @@ jobs:
           prerelease: false
           files: |
             dist/WhisprFlow.exe
+            probe/WhisprFlowProbe.exe
             WhisprFlow-windows.zip
           body: |
             ## WhisprFlow — AI dictation for Windows

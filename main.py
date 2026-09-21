@@ -62,8 +62,11 @@ def resource_path(*parts) -> Path:
 
 CONFIG_DIR = default_config_dir()
 ENV_PATH = CONFIG_DIR / ".env"
-load_dotenv(ENV_PATH)
-load_dotenv()  # also honour a project-local .env during development
+try:
+    load_dotenv(ENV_PATH)
+    load_dotenv()  # also honour a project-local .env during development
+except Exception:
+    pass  # a malformed .env must never stop the app from starting
 
 DEBUG = os.getenv("WHISPRFLOW_DEBUG", "").lower() in ("1", "true", "yes")
 
@@ -72,6 +75,39 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
 )
 logger = logging.getLogger("whisprflow")
+
+# ── Startup forensics ─────────────────────────────────────────────────────
+# A windowed PyInstaller exe has no console: a crash during launch shows
+# NOTHING (reported 2026-09-21: spiral cursor, then no window, no pill,
+# process gone). Every launch appends breadcrumb milestones to this file,
+# and faulthandler dumps native faults there too, so even an instant exit
+# leaves evidence. Everything here must be incapable of raising.
+try:
+    import faulthandler as _faulthandler
+
+    _STARTUP_LOG = CONFIG_DIR / "startup.log"
+    _LOG_FH = open(_STARTUP_LOG, "a", encoding="utf-8", buffering=1)
+    _LOG_FH.write(
+        f"\n=== {datetime.now().isoformat(timespec='seconds')} launch "
+        f"pid={os.getpid()} frozen={bool(getattr(sys, 'frozen', False))} "
+        f"exe={getattr(sys, 'executable', '?')} ===\n")
+    _faulthandler.enable(file=_LOG_FH)
+    logger.addHandler(logging.FileHandler(_STARTUP_LOG, encoding="utf-8"))
+except Exception:
+    _LOG_FH = None
+
+
+def trace(msg: str) -> None:
+    """One breadcrumb line in startup.log. Swallows every error by design."""
+    try:
+        if _LOG_FH is not None:
+            _LOG_FH.write(
+                f"{datetime.now().isoformat(timespec='milliseconds')}  {msg}\n")
+    except Exception:
+        pass
+
+
+trace("main module imported")
 
 
 def _flag(name: str, default: bool) -> bool:
@@ -198,6 +234,7 @@ def _foreground_process() -> str:
 
 class WhisprFlowApp:
     def __init__(self):
+        trace("app init: begin")
         self.dictionary = UserDictionary()
         self.injector = TextInjector()
         # Command Mode is the one feature that still calls an LLM directly;
@@ -214,12 +251,14 @@ class WhisprFlowApp:
         # back together. This replaced the old streaming/batch STT + Groq
         # refiner + guard stack (see AUDIT_REPORT.md section 5).
         self.stt = DictationClient(api_key=os.getenv("ASSEMBLYAI_API_KEY", ""))
+        trace("app init: clients ok")
 
         # Always-on capture. The stream opens once and stays open, so the
         # pre-roll ring already holds the moment before the hotkey fired.
         saved_mic = os.getenv("WHISPRFLOW_MIC_DEVICE", "").strip()
         mic_index = AudioCapture.find_device_by_identifier(saved_mic)
         self.capture = AudioCapture(device=mic_index)
+        trace("app init: capture ok")
         self._device_map = {}
         self._meter_running = False
 
@@ -229,6 +268,7 @@ class WhisprFlowApp:
         self.profiles.write_template()
         self.snippets = SnippetSet(CONFIG_DIR / "snippets.json")
         self.snippets.write_template()
+        trace("app init: profiles/snippets ok")
 
         self._profile_instruction = ""
         self._profile_allow_format = True
@@ -284,6 +324,7 @@ class WhisprFlowApp:
         self.kb_controller = KeyboardController()
 
         # Window
+        trace("app init: creating Tk")
         self.root = tk.Tk()
         self.root.title("WhisprFlow")
         self.root.geometry("640x720")
@@ -299,6 +340,7 @@ class WhisprFlowApp:
         self.formatting_enabled = tk.BooleanVar(value=self._format_on)
 
         self._build_ui()
+        trace("app init: settings UI built")
         self.pill = FloatingPill(
             self.root,
             get_level=self.capture.get_level,
@@ -306,8 +348,10 @@ class WhisprFlowApp:
             on_cancel=self.cancel_recording,
             on_retry=self.retry,
         )
+        trace("app init: pill ok")
         self.root.withdraw()
         self.tray = self._build_tray()
+        trace("app init: tray ok -- init complete")
 
     # ══════════════════════════════════════════════════════════════════
     #  UI
@@ -1698,6 +1742,7 @@ class WhisprFlowApp:
         os._exit(0)
 
     def run(self):
+        trace("run: starting asyncio thread")
         threading.Thread(
             target=lambda: (asyncio.set_event_loop(self.loop), self.loop.run_forever()),
             daemon=True, name="asyncio").start()
@@ -1718,17 +1763,22 @@ class WhisprFlowApp:
         ]
         for l in self._listeners:
             l.start()
+        trace("run: hotkey listeners + watchdog started")
         threading.Thread(target=self._watch_listeners, daemon=True,
                          name="hotkey-watchdog").start()
         threading.Thread(target=self.tray.run, daemon=True, name="tray").start()
 
         if not self.stt.is_configured:
             self.log("No AssemblyAI key — open settings to add one.", "warn")
+            trace("run: no key -- opening settings window")
             self.root.after(400, self.show_window)
         else:
+            trace("run: key present -- starting in tray")
             self.log("Ready. Hold Ctrl + Win to dictate.", "ok")
 
+        trace("run: entering mainloop")
         self.root.mainloop()
+        trace("run: mainloop exited")
 
 
 def _safe_call(fn, *args):
@@ -1764,7 +1814,11 @@ def _fatal(title: str, message: str) -> None:
     surfaces as an unreadable wall of text. Worse, that dialog keeps the
     process alive -- which is how a broken v1.0.0 passed its own CI check.
     """
-    sys.stderr.write(f"{title}\n\n{message}\n")
+    try:
+        if sys.stderr:
+            sys.stderr.write(f"{title}\n\n{message}\n")
+    except Exception:
+        pass
     try:
         import tkinter as tk
         from tkinter import messagebox
@@ -1807,7 +1861,9 @@ def _check_runtime() -> None:
 
 
 if __name__ == "__main__":
+    trace("entry: _check_runtime")
     _check_runtime()
+    trace("entry: runtime ok")
     try:
         app = WhisprFlowApp()
         app.run()
@@ -1815,6 +1871,10 @@ if __name__ == "__main__":
         os._exit(0)
     except Exception as exc:
         logger.exception("Fatal error during startup")
+        try:
+            trace("FATAL during startup:\n" + traceback.format_exc())
+        except Exception:
+            pass
         _fatal(
             "WhisprFlow — startup failed",
             f"{type(exc).__name__}: {exc}\n\n"

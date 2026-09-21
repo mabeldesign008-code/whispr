@@ -29,7 +29,14 @@ def default_config_dir() -> Path:
     else:
         base = os.getenv("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
     d = Path(base) / "WhisprFlow"
-    d.mkdir(parents=True, exist_ok=True)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # An unwritable/redirected %APPDATA% must not kill the launch;
+        # fall back to a writable location and keep going.
+        import tempfile
+        d = Path(tempfile.gettempdir()) / "WhisprFlow"
+        d.mkdir(parents=True, exist_ok=True)
     return d
 
 
