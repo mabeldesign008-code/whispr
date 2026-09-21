@@ -1,8 +1,10 @@
 """
 WhisprFlow — system-wide AI dictation for Windows.
 
-Pipeline:  hotkey → always-on capture (with pre-roll) → AssemblyAI
-           → Groq refinement → hallucination guard → inject at cursor
+Pipeline:  hotkey → always-on capture (with pre-roll)
+           → AssemblyAI Dictation API (verbatim + cleaned text, one POST)
+           → local fallback cleanup if the server rewrite failed
+           → inject at cursor (focus-anchored)
 """
 
 import asyncio
@@ -264,9 +266,15 @@ class WhisprFlowApp:
 
         self.loop = asyncio.new_event_loop()
 
-        # Hotkeys
+        # Hotkeys. pressed_keys maps canonical key -> monotonic press time,
+        # NOT a plain set: a key whose release event gets lost (Win+L lock,
+        # UAC prompt, sleep/resume, admin app swallowing the hook) used to
+        # stay "pressed" forever and brick the exact-match combo until the
+        # app was restarted. Entries older than _STUCK_KEY_SECONDS are
+        # assumed lost and dropped (see _prune_stuck_keys).
         self.hotkey_combo = {keyboard.Key.ctrl_l, keyboard.Key.cmd}
-        self.pressed_keys = set()
+        self.pressed_keys = {}
+        self._listeners = []
         self.kb_controller = KeyboardController()
 
         # Window
@@ -1387,6 +1395,13 @@ class WhisprFlowApp:
     # Below this, a press counts as a "tap" (lock on) rather than a hold.
     TAP_SECONDS = 0.35
 
+    # A key reported down for this long without a release event means the
+    # release was lost (Win+L lock, UAC prompt, sleep/resume, admin app
+    # swallowing the hook) -- nobody holds a modifier for 30 s *before*
+    # starting a take. During a take pruning is skipped on purpose: long
+    # holds are legitimate then, and the stop logic uses _press_time.
+    _STUCK_KEY_SECONDS = 30.0
+
     _KEY_ALIASES = None
 
     @classmethod
@@ -1425,7 +1440,36 @@ class WhisprFlowApp:
         return cls._key_aliases().get(key, key)
 
     def on_press(self, key):
+        # pynput stops a Listener whose callback raises -- silently, with no
+        # user-visible error. That used to present as "worked at first, then
+        # the hotkey just stopped doing anything". The wrapper makes the
+        # hook unkillable by app code; the watchdog below covers the rest.
+        try:
+            self._on_press(key)
+        except Exception:
+            logger.exception("on_press failed")
+
+    def on_release(self, key):
+        try:
+            self._on_release(key)
+        except Exception:
+            logger.exception("on_release failed")
+
+    def _prune_stuck_keys(self):
+        now = time.monotonic()
+        stuck = [k for k, ts in self.pressed_keys.items()
+                 if now - ts > self._STUCK_KEY_SECONDS]
+        for k in stuck:
+            self.pressed_keys.pop(k, None)
+            name = getattr(k, "name", str(k))
+            self.log(f"Stuck \u201c{name}\u201d cleared (its key-up was lost "
+                     "— lock screen, UAC prompt, or sleep). Hotkey is fine.",
+                     "warn")
+
+    def _on_press(self, key):
         key = self._canonical_key(key)
+        if not self.is_recording:
+            self._prune_stuck_keys()
         # Esc cancels a recording -- with hands free, reaching for the pill
         # with the mouse is the wrong reflex. Handled *before* the key joins
         # pressed_keys, so a stray Esc can never pollute the set and break the
@@ -1438,17 +1482,18 @@ class WhisprFlowApp:
                 self.cancel_recording()
             return
 
-        self.pressed_keys.add(key)
+        self.pressed_keys[key] = time.monotonic()
+        current = set(self.pressed_keys)
 
         # Command Mode: capture the selection first, then record an
         # instruction to apply to it.
-        if self.pressed_keys == self.command_combo and not self.is_recording:
+        if current == self.command_combo and not self.is_recording:
             self.start_command_mode()
             return
 
         # Exact match only. `issubset` meant Ctrl+Win+D (new desktop) and
         # Ctrl+Win+arrows all started phantom recordings.
-        if self.pressed_keys != self.hotkey_combo:
+        if current != self.hotkey_combo:
             return
 
         if self.locked:
@@ -1459,10 +1504,10 @@ class WhisprFlowApp:
             self._press_time = time.monotonic()
             self.start_recording()
 
-    def on_release(self, key):
+    def _on_release(self, key):
         key = self._canonical_key(key)
         was_hotkey = key in self.hotkey_combo or key in self.command_combo
-        self.pressed_keys.discard(key)
+        self.pressed_keys.pop(key, None)
         if not (was_hotkey and self.is_recording and self._press_time):
             return
 
@@ -1474,7 +1519,8 @@ class WhisprFlowApp:
         # whatever the user said next became a take and got pasted (audit C11).
         # Cancel, do not transcribe.
         combo = self.command_combo if self.command_mode else self.hotkey_combo
-        extras = {k for k in (self.pressed_keys - combo) if k != keyboard.Key.esc}
+        extras = {k for k in (set(self.pressed_keys) - combo)
+                  if k != keyboard.Key.esc}
         if extras:
             self.cancel_recording()
             self.log('Ignored: ' + ', '.join(getattr(k, 'name', str(k)) for k in extras)
@@ -1494,6 +1540,12 @@ class WhisprFlowApp:
             self.stop_recording()
 
     def undo(self):
+        try:
+            self._undo()
+        except Exception:
+            logger.exception("undo failed")
+
+    def _undo(self):
         """Ctrl+Z is safer than replaying N backspaces: most apps coalesce a
         paste into one undo step, and blind backspaces eat real text when
         the caret has moved."""
@@ -1510,6 +1562,37 @@ class WhisprFlowApp:
     # ══════════════════════════════════════════════════════════════════
     #  Window / lifecycle
     # ══════════════════════════════════════════════════════════════════
+
+    def _make_listener(self, index):
+        if index == 0:
+            return keyboard.Listener(
+                on_press=self.on_press, on_release=self.on_release)
+        return keyboard.GlobalHotKeys({"<ctrl>+<alt>+z": self.undo})
+
+    def _watch_listeners(self):
+        """Restart dead hotkey listeners.
+
+        Windows can remove a low-level hook without delivering any error
+        (hook-timeout budget, sleep/resume), and pynput's message loop just
+        ends. The callbacks are already wrapped so app code can't kill the
+        hook, but nothing in user code can catch the OS taking it away --
+        only noticing the thread is gone can. A dead listener used to be
+        indistinguishable from "the app just stopped responding to Ctrl+Win".
+        """
+        while True:
+            time.sleep(2.0)
+            for i, l in enumerate(list(self._listeners)):
+                if l.is_alive():
+                    continue
+                logger.warning("hotkey listener %d died; restarting", i)
+                try:
+                    listener = self._make_listener(i)
+                    listener.start()
+                    self._listeners[i] = listener
+                    self.log("Hotkey hook was lost and has been restarted.",
+                             "warn")
+                except Exception:
+                    logger.exception("listener restart failed")
 
     def hide_window(self):
         self._meter_running = False
@@ -1563,8 +1646,14 @@ class WhisprFlowApp:
         # Pre-warm the TLS session so the first dictation doesn't pay for it.
         asyncio.run_coroutine_threadsafe(self.stt.warm(), self.loop)
 
-        keyboard.Listener(on_press=self.on_press, on_release=self.on_release).start()
-        keyboard.GlobalHotKeys({"<ctrl>+<alt>+z": self.undo}).start()
+        self._listeners = [
+            keyboard.Listener(on_press=self.on_press, on_release=self.on_release),
+            keyboard.GlobalHotKeys({"<ctrl>+<alt>+z": self.undo}),
+        ]
+        for l in self._listeners:
+            l.start()
+        threading.Thread(target=self._watch_listeners, daemon=True,
+                         name="hotkey-watchdog").start()
         threading.Thread(target=self.tray.run, daemon=True, name="tray").start()
 
         if not self.stt.is_configured:

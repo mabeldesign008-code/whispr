@@ -112,6 +112,21 @@ is one syscall (`psutil.Process(pid).name()`), done at recording start
 so it never sits on the critical path. A template file is written on
 first run; users add their own apps.
 
+## Hotkey resilience
+
+The "hotkey stops responding after a while" failure had three causes, and
+each now has a dedicated countermeasure:
+
+1. **Lost key-up events** (Win+L lock, UAC prompt, sleep/resume, admin
+   app) left phantom keys in the exact-match set forever. `pressed_keys`
+   is now timestamped and entries older than 30 s are dropped with a
+   visible log line; pruning pauses during takes.
+2. **pynput stops a listener whose callback raises** — silently. Every
+   callback is wrapped so app code can never kill the hook thread.
+3. **Windows can remove a low-level hook without any error.** A watchdog
+   thread checks `listener.is_alive()` every 2 s and recreates dead
+   listeners automatically.
+
 ## Thread safety
 
 - Tk widgets: main thread only. Everything else marshals via
